@@ -1050,7 +1050,7 @@ async function swapEvent(params) {
         const uniIn = uni?.reserveIn ?? 0n;
         const sushiIn = sushi?.reserveIn ?? 0n;
 
-        const reserveIn = uniIn > sushiIn ? uniIn : sushiIn;
+        const reserveIn = uniIn < sushiIn ? uniIn : sushiIn;
         if (reserveIn <= 0n) continue;
 
         const SCALE = 1_000_000_000n;
@@ -1268,7 +1268,7 @@ async function determineDirection(
       endingReserves.sTarget = isBaseInput ? swap.newReserveOut : swap.newReserveIn;
     }
 
-    // ------------------- PRICE CALC -------------------
+    // ------------------- PRICE CALC ------------------- 
     const SCALED = 10n ** BigInt(targetToken.decimals);
 
     const uniWethPerTokenStart = startingReserves.uTarget > 0n ? (startingReserves.uBase * SCALED) / startingReserves.uTarget: 0n;
@@ -1282,14 +1282,38 @@ async function determineDirection(
     const sushiUsdcPerTokenEnd = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenEnd, targetToken.decimals)) * sushiWethPriceUSDC : NaN;
 
     // ------------------- EXECUTION FEASIBILITY CHECK -------------------
-    const exitLiquidity = [endingReserves.uTarget, endingReserves.uBase, endingReserves.sTarget, endingReserves.sBase].reduce((a, b) => a < b ? a : b);
-    const SAFETY_BUFFER = exitLiquidity > 1000n ? 2n : 1n;
-    const maxExecutableTrade = exitLiquidity / SAFETY_BUFFER;
+
+    // Per-DEX WETH liquidity (correct model)
+    const uniWethLiquidity = endingReserves.uBase;
+    const sushiWethLiquidity = endingReserves.sBase;
+
+    // Per-DEX max executable (25% of each pool)
+    const uniMaxExecutable = uniWethLiquidity / 4n;
+    const sushiMaxExecutable = sushiWethLiquidity / 4n;
+
+    // Choose relevant DEX based on where the event is happening
+    const isUniswap = eventDex.toLowerCase() === "uniswap";
+
+    const maxExecutableTrade = isUniswap
+      ? uniMaxExecutable
+      : sushiMaxExecutable;
+
+    console.log(`💧 Uniswap WETH Liquidity: ${ethers.formatEther(uniWethLiquidity)}`);
+    console.log(`💧 Sushi WETH Liquidity: ${ethers.formatEther(sushiWethLiquidity)}`);
+
+    console.log(`💧 Selected Max Executable: ${ethers.formatEther(maxExecutableTrade)} WETH`);
+
     const MIN_TRADE = 10n ** 15n; // ~0.001 WETH
     if (maxExecutableTrade < MIN_TRADE) {
       console.log(`❌ Skipping: maxExecutableTrade < MIN_TRADE | max=${maxExecutableTrade.toString()}`);
       return null;
     }
+
+    // Debug
+    console.log("\n🔍 EXECUTION CHECK");
+    console.log("eventDex:", eventDex);
+    console.log("eventAmountIn:", ethers.formatEther(eventAmountIn));
+    console.log("maxExecutableTrade:", ethers.formatEther(maxExecutableTrade));
 
     // HARD FILTER ONLY
     if (eventAmountIn > maxExecutableTrade || maxExecutableTrade <= 0n) {
