@@ -1058,17 +1058,17 @@ async function swapEvent(params) {
         const impactPct = Number(impactScaled) / 1e7;
 
         let signal = "NORMAL";
-        if (impactScaled < 5_000n) signal = "LOW IMPACT";
-        else if (impactScaled < 20_000n) signal = "GOOD ZONE";
-        else if (impactScaled < 50_000n) signal = "HIGH IMPACT";
-        else signal = "EXTREME IMPACT";
+        if (impactScaled < 1_000_000n) signal = "LOW";
+        else if (impactScaled < 5_000_000n) signal = "GOOD";
+        else if (impactScaled < 20_000_000n) signal = "HIGH";
+        else signal = "EXTREME";
 
-        console.log(`📊 Reserve Signal → Impact=${impactPct.toFixed(6)}% | Signal=${signal}`);
-        console.log(`📊 IMPACT DEBUG → raw=${amountIn.toString()} reserve=${reserveIn.toString()} scaled=${impactScaled.toString()}`);
+        console.log(`📊 Reserve Signal → Swap Size Relative To Reserve = ${impactPct.toFixed(6)}% | Signal=${signal}`);
+        console.log(`📊 IMPACT DEBUG → raw=${amountIn.toString()} preSwapReserve=${reserveIn.toString()} scaled=${impactScaled.toString()}`);
         console.log(ORANGE + "═══════════════════════════════════════════════════════════" + RESET);
 
-        if (impactScaled < 2_000n) continue;
-        if (impactScaled > 200_000_000n) continue;
+        if (impactScaled < 500_000n) continue;      // 0.05%
+        if (impactScaled > 200_000_000n) continue;   // 20%
 
         // ============================================================
         // EXECUTION
@@ -1281,21 +1281,29 @@ async function determineDirection(
     const uniUsdcPerTokenEnd = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenEnd, targetToken.decimals)) * uniWethPriceUSDC: NaN;
     const sushiUsdcPerTokenEnd = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenEnd, targetToken.decimals)) * sushiWethPriceUSDC : NaN;
 
-    // ------------------- EXECUTION FEASIBILITY CHECK -------------------
-    const uniTargetReserve = endingReserves.uTarget;
-    const sushiTargetReserve = endingReserves.sTarget;
+    // ------------------- DIRECTIONAL LIQUIDITY CHECK -------------------
+    const isUni = eventDex.toLowerCase() === "uniswap";
 
-    const SAFETY_BUFFER = 2n;
+    // pick correct pool side
+    const exitReserveBefore = isUni
+      ? (isBaseInput ? uReserveTarget : uReserveBase)
+      : (isBaseInput ? sReserveTarget : sReserveBase);
 
-    const exitLiquidity = uniTargetReserve < sushiTargetReserve ? uniTargetReserve : sushiTargetReserve;
-    const maxExecutableTrade = exitLiquidity / SAFETY_BUFFER;
+    const exitReserveAfter = isUni
+      ? (isBaseInput ? endingReserves.uTarget : endingReserves.uBase)
+      : (isBaseInput ? endingReserves.sTarget : endingReserves.sBase);
 
-    // HARD FILTER ONLY
-    if (eventAmountIn > maxExecutableTrade || maxExecutableTrade <= 0n) {
+    // 30% minimum retained liquidity
+    const LIQUIDITY_COLLAPSE_THRESHOLD = 30n;
+
+    const minSafeExitLiquidity =
+      (exitReserveBefore * LIQUIDITY_COLLAPSE_THRESHOLD) / 100n;
+
+    if (exitReserveAfter < minSafeExitLiquidity) {
       console.log(
-        `❌ Skipping: insufficient executable liquidity ` +
-        `| event=${eventAmountIn.toString()} ` +
-        `| max=${maxExecutableTrade.toString()}`
+        `❌ Skipping: exit liquidity collapse too large ` +
+        `| before=${exitReserveBefore.toString()} ` +
+        `| after=${exitReserveAfter.toString()}`
       );
       return null;
     }
@@ -1719,4 +1727,4 @@ async function executeTrade({
 // ─────────────────────────────────────────
 main().catch(console.error);
 
-// Works !! Got Main and swapEvent seperate. All functions seems to work good! Any bugs??
+// Works !! bot works on both pump and dump tests and when on Mainnet!!
