@@ -1,3 +1,8 @@
+/**
+ * Generic Token Pump/Dump Test (Multi-Token, Accurate ROI)
+ * Ethers v6 + BigInt safe
+ */
+
 const hre = require("hardhat");
 const { ethers, network } = hre;
 
@@ -8,242 +13,269 @@ const WETH = "0xC02aaA39b223FE8D0A0e5c4f27eAD9083C756Cc2".toLowerCase();
 const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".toLowerCase();
 const PRECISION = 10n ** 18n;
 
-// ===== Display Colors =====
-const ORANGE = "\x1b[38;5;208m";
-const RESET = "\x1b[0m";
-function border() {
-    console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
-}
+// ===== Router registry =====
+const ROUTERS = { [UNI_ROUTER]: "Uniswap V2" };
 
-// ===== Router Registry =====
-const ROUTERS = {
-    [UNI_ROUTER]: "Uniswap V2",
-    "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f": "SushiSwap"
-};
-function resolveRouterName(address) {
-    return ROUTERS[address.toLowerCase()] || "Unknown Router";
-}
-
-// ===== Token Config =====
+// ===== Token config =====
 const TOKEN_CONFIG = {
-    LDO: { symbol: "LDO", address: "0x5a98fcbea516cf06857215779fd812ca3bef1b32".toLowerCase(), whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase() },
-    LINK: { symbol: "LINK", address: "0x514910771af9ca656af840dff83e8264ecf986ca".toLowerCase(), whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase() },
-    AAVE: { symbol: "AAVE", address: "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9".toLowerCase(), whale: "0x25f2226b597e8f9514b3f68f00f494cf4f286491".toLowerCase() },
-    SHIB: { symbol: "SHIB", address: "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE".toLowerCase(), whale: "0x28C6c06298d514Db089934071355E5743bf21d60".toLowerCase() },
-    ALCX: { symbol: "ALCX", address: "0xDBdBd135c4fAf1a816bBb8d85Ca20b9b215Ebb81".toLowerCase(), whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase()}
+  LINK: {
+    symbol: "LINK",
+    address: "0x514910771af9ca656af840dff83e8264ecf986ca".toLowerCase(),
+    whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase()
+  },
+  LDO: {
+    symbol: "LDO",
+    address: "0x5a98fcbea516cf06857215779fd812ca3bef1b32".toLowerCase(),
+    whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase()
+  },
+  AAVE: {
+    symbol: "AAVE",
+    address: "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9".toLowerCase(),
+    whale: "0x25f2226b597e8f9514b3f68f00f494cf4f286491".toLowerCase()
+  },
+  SHIB: {
+    symbol: "SHIB",
+    address: "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE".toLowerCase(),
+    whale: "0x28C6c06298d514Db089934071355E5743bf21d60".toLowerCase()
+  }
 };
 
-// ===== Token Symbol Registry =====
-const TOKEN_SYMBOLS = { [WETH]: "WETH", [USDC]: "USDC" };
-for (const t of Object.values(TOKEN_CONFIG)) TOKEN_SYMBOLS[t.address] = t.symbol;
-function resolveSymbol(address) { return TOKEN_SYMBOLS[address.toLowerCase()] || address.slice(0,6); }
+// ===== Token symbols =====
+const TOKEN_SYMBOLS = {
+  [WETH]: "WETH",
+  [USDC]: "USDC",
+  ...Object.fromEntries(Object.values(TOKEN_CONFIG).map(t => [t.address, t.symbol]))
+};
 
-// ===== Settings =====
-const liquidityTokens = "20000";
-const swapWeth = "10";
-const wethLiquidity = "50";
+// ===== Swap settings =====
+// Increased liquidity to ensure bot executes
+const liquidityTokens = "500000"; // 500k tokens
+const swapTokens = "10000";       // 10k tokens for swap
+const wethLiquidity = "1000";     // 1000 WETH
 
 // ===== ABIs =====
 const ERC20_ABI = [
-    "function balanceOf(address) view returns(uint256)",
-    "function approve(address,uint256) returns(bool)",
-    "function transfer(address,uint256) returns(bool)",
-    "function decimals() view returns(uint8)",
-    "function allowance(address,address) view returns(uint256)",
-    "function deposit() payable"
+  "function balanceOf(address) view returns(uint256)",
+  "function approve(address,uint256) returns(bool)",
+  "function allowance(address,address) view returns(uint256)",
+  "function decimals() view returns(uint8)",
+  "function deposit() payable"
 ];
-const FACTORY_ABI = [
-    "function getPair(address,address) view returns(address)",
-    "function createPair(address,address) returns(address)"
-];
+const FACTORY_ABI = ["function getPair(address,address) view returns(address)"];
 const PAIR_ABI = [
-    "function getReserves() view returns(uint112,uint112,uint32)",
-    "function token0() view returns(address)"
+  "function getReserves() view returns(uint112,uint112,uint32)",
+  "function token0() view returns(address)"
 ];
 const ROUTER_ABI = [
-    "function swapExactTokensForTokens(uint,uint,address[],address,uint) returns(uint[])",
-    "function addLiquidity(address,address,uint,uint,uint,uint,address,uint)"
+  "function swapExactTokensForTokens(uint,uint,address[],address,uint) returns(uint[])",
+  "function addLiquidity(address,address,uint,uint,uint,uint,address,uint)"
 ];
 
-// ===== Math Helpers =====
-function computePrice(reserveOut, reserveIn) { return (reserveOut * PRECISION) / reserveIn; }
-function toFloat(priceBigInt) { return Number(priceBigInt) / 1e18; }
-function percentChange(before, after) { return Number(((after - before) * 10000n) / before) / 100; }
-function formatPath(path) { return path.map(resolveSymbol).join(" → "); }
+// ===== Helpers =====
+function resolveSymbol(address) {
+  return TOKEN_SYMBOLS[address.toLowerCase()] || address.slice(0, 6);
+}
+function resolveRouterName(address) {
+  return ROUTERS[address.toLowerCase()] || "Unknown Router";
+}
+function formatPath(path) {
+  return path.map(resolveSymbol).join(" → ");
+}
+function computePrice(reserveOut, reserveIn) {
+  return (reserveOut * PRECISION) / reserveIn;
+}
+function toFloat(priceBigInt) {
+  return Number(priceBigInt) / 1e18;
+}
+function percentChange(before, after) {
+  return Number(((after - before) * 10000n) / before) / 100;
+}
 
-// ===== Display Function ===== await router
+// ===== Display =====
+const ORANGE = "\x1b[38;5;208m";
+const RESET = "\x1b[0m";
+
 function displayResult({
-    tokenSymbol, priceBefore, priceAfter, priceBeforeUSDC, priceAfterUSDC,
-    percent, tokenReserveAfter, wethReserveAfter, tokenDecimals,
-    routerAddress, routerPath, tradeWeth, tokensReceived,
-    profitWETH, profitUSDC, roi
+  tokenSymbol,
+  priceBefore,
+  priceAfter,
+  priceBeforeUSDC,
+  priceAfterUSDC,
+  percent,
+  tokenReserveAfter,
+  wethReserveAfter,
+  tokenDecimals,
+  routerAddress,
+  routerPath,
+  profitWETH,
+  profitUSDC,
+  roi
 }) {
-    border();
-    console.log(`💰 Token: ${tokenSymbol}`);
-    console.log(`🔹 Liquidity Pool: ${tokenSymbol}/WETH`);
-    border();
+  console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
+  console.log(`💰 Token: ${tokenSymbol}`);
+  console.log(`🔹 Liquidity Pool: ${tokenSymbol}/WETH`);
+  console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
 
-    console.log("\n💸 Price BEFORE Swap");
-    console.log(`1 ${tokenSymbol} ≈ ${toFloat(priceBefore)} WETH`);
-    console.log(`1 ${tokenSymbol} ≈ ${priceBeforeUSDC.toFixed(6)} USDC`);
+  console.log("\n💸 Price BEFORE Swap");
+  console.log(`1 ${tokenSymbol} ≈ ${toFloat(priceBefore)} WETH`);
+  console.log(`1 ${tokenSymbol} ≈ ${priceBeforeUSDC.toFixed(6)} USDC`);
 
-    console.log("\n💸 Price AFTER Swap");
-    console.log(`1 ${tokenSymbol} ≈ ${toFloat(priceAfter)} WETH`);
-    console.log(`1 ${tokenSymbol} ≈ ${priceAfterUSDC.toFixed(6)} USDC`);
+  console.log("\n💸 Price AFTER Swap");
+  console.log(`1 ${tokenSymbol} ≈ ${toFloat(priceAfter)} WETH`);
+  console.log(`1 ${tokenSymbol} ≈ ${priceAfterUSDC.toFixed(6)} USDC`);
 
-    console.log("\n📊 Price Change");
-    console.log(`Δ %: ${percent.toFixed(4)}%`);
+  console.log("\n📊 Price Change");
+  console.log(`Δ %: ${percent.toFixed(4)}%`);
 
-    console.log("\n🧭 Router");
-    console.log(resolveRouterName(routerAddress));
+  console.log("\n🧭 Router");
+  console.log(resolveRouterName(routerAddress));
 
-    console.log("\n🔀 Path");
-    console.log(formatPath(routerPath));
+  console.log("\n🔀 Path");
+  console.log(formatPath(routerPath));
 
-    console.log("\n📈 Reserves");
-    console.log(`${tokenSymbol}: ${ethers.formatUnits(tokenReserveAfter, tokenDecimals)}`);
-    console.log(`WETH: ${ethers.formatEther(wethReserveAfter)}`);
+  console.log("\n📈 Reserves");
+  console.log(`${tokenSymbol}: ${ethers.formatUnits(tokenReserveAfter, tokenDecimals)}`);
+  console.log(`WETH: ${ethers.formatEther(wethReserveAfter)}`);
 
-    console.log("\n📊 Trade Analytics");
-    console.log(`Trade Size: ${tradeWeth} WETH`);
-    console.log(`Tokens Received: ${tokensReceived} ${tokenSymbol}`);
+  console.log("\n🚀 Estimated Swap Profit / ROI:");
+  console.log(`Profit (WETH): ${profitWETH.toFixed(6)}`);
+  console.log(`Profit (USDC): ${profitUSDC.toFixed(2)}`);
+  console.log(`ROI: ${roi.toFixed(4)} %`);
 
-    console.log("\n🚀 Estimated Swap Profit / ROI:");
-    console.log(`Profit (WETH): ${profitWETH.toFixed(6)}`);
-    console.log(`Profit (USDC): ${profitUSDC.toFixed(2)}`);
-    console.log(`ROI: ${roi.toFixed(4)} %`);
-
-    border();
+  console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
 }
 
-// ===== Main Test Function =====
-async function runGenericPump(symbol) {
-    if (!TOKEN_CONFIG[symbol]) throw new Error(`Token ${symbol} not defined in TOKEN_CONFIG`);
+// ===== Main Test =====
+async function runGenericTest(symbol) {
+  const config = TOKEN_CONFIG[symbol];
+  const whale = config.whale;
 
-    const config = TOKEN_CONFIG[symbol];
-    const trader = (await ethers.getSigners())[0];
-    const whale = config.whale;
+  console.log(`\n🧪 Testing ${symbol} with whale ${whale}\n`);
 
-    console.log(`🧪 Testing ${symbol} with whale ${whale}\n`);
+  await network.provider.request({ method: "hardhat_impersonateAccount", params: [whale] });
+  await network.provider.request({ method: "hardhat_setBalance", params: [whale, "0x1000000000000000000000"] });
 
-    // ===== Impersonate whale and set balance =====
-    await network.provider.request({ method: "hardhat_impersonateAccount", params: [whale] });
-    await network.provider.request({ method: "hardhat_setBalance", params: [whale, "0x1000000000000000000000"] });
-    const whaleSigner = await ethers.getSigner(whale);
+  const signer = await ethers.getSigner(whale);
+  const token = await ethers.getContractAt(ERC20_ABI, config.address);
+  const weth = await ethers.getContractAt(ERC20_ABI, WETH);
+  const usdc = await ethers.getContractAt(ERC20_ABI, USDC);
 
-    // ===== Contracts =====
-    const token = await ethers.getContractAt(ERC20_ABI, config.address, trader);
-    const weth = await ethers.getContractAt(ERC20_ABI, WETH, trader);
-    const usdc = await ethers.getContractAt(ERC20_ABI, USDC, trader);
-    const router = await ethers.getContractAt(ROUTER_ABI, UNI_ROUTER, trader);
-    const factory = await ethers.getContractAt(FACTORY_ABI, FACTORY, trader);
+  const tokenDecimals = await token.decimals();
+  const usdcDecimals = await usdc.decimals();
 
-    const tokenDecimals = await token.decimals();
-    const usdcDecimals = await usdc.decimals();
-    const liquidityTokenBN = ethers.parseUnits(liquidityTokens, tokenDecimals);
-    const swapWethBN = ethers.parseEther(swapWeth);
-    const wethLiquidityBN = ethers.parseEther(wethLiquidity);
+  const liquidityTokenBN = ethers.parseUnits(liquidityTokens, tokenDecimals);
+  const swapTokenBN = ethers.parseUnits(swapTokens, tokenDecimals);
+  const wethLiquidityBN = ethers.parseEther(wethLiquidity);
 
-    const traderAddress = await trader.getAddress();
-    const traderEthBalance = await trader.provider.getBalance(traderAddress);
-    console.log(`Trader ETH balance: ${ethers.formatEther(traderEthBalance)} ETH`);
+  const whaleBalance = await token.balanceOf(whale);
+  console.log(`💰 Whale Balance: ${ethers.formatUnits(whaleBalance, tokenDecimals)} ${symbol}`);
+  if (BigInt(whaleBalance) < swapTokenBN) throw new Error("Whale lacks tokens for swap");
 
-    // ===== Transfer tokens from whale first =====
-    const whaleBalance = await token.balanceOf(whale);
-    console.log(`💰 Whale Balance: ${ethers.formatUnits(whaleBalance, tokenDecimals)} ${symbol}`);
-    await token.connect(whaleSigner).transfer(traderAddress, liquidityTokenBN);
-    const traderBalance = await token.balanceOf(traderAddress);
-    console.log(`👤 Trader Balance after transfer: ${ethers.formatUnits(traderBalance, tokenDecimals)} ${symbol}`);
+  const router = await ethers.getContractAt(ROUTER_ABI, UNI_ROUTER);
+  const factory = await ethers.getContractAt(FACTORY_ABI, FACTORY);
 
-    // ===== Approvals AFTER transfer =====
-    await token.connect(trader).approve(UNI_ROUTER, 0);                   // reset allowance first
-    await token.connect(trader).approve(UNI_ROUTER, ethers.MaxUint256);  // then approve max
-    await weth.connect(trader).approve(UNI_ROUTER, ethers.MaxUint256);   // approve WETH once
+  // Approvals
+  const tokenAllowance = await token.allowance(whale, UNI_ROUTER);
+  if (BigInt(tokenAllowance) < liquidityTokenBN + swapTokenBN)
+    await token.connect(signer).approve(UNI_ROUTER, ethers.MaxUint256);
 
-    // ===== Wrap ETH → WETH =====
-    console.log(`🔄 Wrapped ${wethLiquidity} ETH → WETH`);
-    await weth.connect(trader).deposit({ value: wethLiquidityBN });
+  const wethAllowance = await weth.allowance(whale, UNI_ROUTER);
+  if (BigInt(wethAllowance) < wethLiquidityBN)
+    await weth.connect(signer).approve(UNI_ROUTER, ethers.MaxUint256);
 
-    // ===== Get or create pair =====
-    let pairAddress = await factory.getPair(config.address, WETH);
-    if (pairAddress === ethers.ZeroAddress) {
-        console.log(`⚠️ Pair does not exist, creating...`);
-        await factory.createPair(config.address, WETH);
-        pairAddress = await factory.getPair(config.address, WETH);
-    }
-    console.log(`✅ Pair exists: ${pairAddress}`);
+  // Get Pair & reserves
+  const pairAddress = await factory.getPair(config.address, WETH);
+  const pair = await ethers.getContractAt(PAIR_ABI, pairAddress);
+  const token0 = await pair.token0();
+  let [r0, r1] = await pair.getReserves();
+  let [tokenReserve, wethReserve] = token0.toLowerCase() === config.address ? [r0, r1] : [r1, r0];
 
-    const pair = await ethers.getContractAt(PAIR_ABI, pairAddress, trader);
-    const token0 = await pair.token0();
-    let [r0Before, r1Before] = await pair.getReserves();
-    const [tokenReserveBefore, wethReserveBefore] = token0.toLowerCase() === config.address ? [r0Before, r1Before] : [r1Before, r0Before];
-    console.log(`Pair reserves BEFORE swap: ${ethers.formatUnits(tokenReserveBefore, tokenDecimals)} ${symbol}, ${ethers.formatEther(wethReserveBefore)} WETH`);
+  console.log(`🔹 Initial Reserves - ${symbol}: ${ethers.formatUnits(tokenReserve, tokenDecimals)}, WETH: ${ethers.formatEther(wethReserve)}`);
 
-    // ===== Swap WETH → Token =====
-    console.log(`🔄 Swapping ${swapWeth} WETH → ${symbol}`);
-    const swapPath = [WETH, config.address];
-    const balanceBefore = await token.balanceOf(traderAddress);
-    const tx = await router.swapExactTokensForTokens(
-  swapWethBN,
-  0n,
-  swapPath,
-  traderAddress,
-  BigInt(Math.floor(Date.now()/1000)+600)
-);
+  // ===== FORCE liquidity addition =====
+  console.log("💧 FORCING Liquidity Addition...");
+  await weth.connect(signer).deposit({ value: wethLiquidityBN });
+  await router.connect(signer).addLiquidity(
+    config.address,
+    WETH,
+    liquidityTokenBN,
+    wethLiquidityBN,
+    0n,
+    0n,
+    whale,
+    BigInt(Math.floor(Date.now() / 1000) + 600)
+  );
+  console.log("✅ Liquidity Added");
 
-const receipt = await tx.wait();
+  // Refresh reserves after liquidity
+  [r0, r1] = await pair.getReserves();
+  [tokenReserve, wethReserve] = token0.toLowerCase() === config.address ? [r0, r1] : [r1, r0];
 
-console.log("🧾 Swap tx mined in block:", receipt.blockNumber);
-console.log("🧾 Receipt logs count:", receipt.logs.length);
-    const balanceAfter = await token.balanceOf(traderAddress);
-    const tokensReceived = Number(ethers.formatUnits(balanceAfter - balanceBefore, tokenDecimals));
+  console.log(`🔹 Reserves AFTER Liquidity - ${symbol}: ${ethers.formatUnits(tokenReserve, tokenDecimals)}, WETH: ${ethers.formatEther(wethReserve)}`);
 
-    const [r0After, r1After] = await pair.getReserves();
-    const [tokenReserveAfter, wethReserveAfter] = token0.toLowerCase() === config.address ? [r0After, r1After] : [r1After, r0After];
-    const priceBefore = computePrice(wethReserveBefore, tokenReserveBefore);
-    const priceAfter = computePrice(wethReserveAfter, tokenReserveAfter);
+  // WETH/USDC price
+  const wuPairAddr = await factory.getPair(WETH, USDC);
+  const wuPair = await ethers.getContractAt(PAIR_ABI, wuPairAddr);
+  const token0wu = await wuPair.token0();
+  const [wu0, wu1] = await wuPair.getReserves();
+  const [wethRes, usdcRes] = token0wu.toLowerCase() === WETH ? [wu0, wu1] : [wu1, wu0];
+  const wethPriceUSDC = Number(ethers.formatUnits(usdcRes, usdcDecimals)) / Number(ethers.formatEther(wethRes));
 
-    // ===== WETH → USDC price =====
-    const wethUsdcPairAddr = await factory.getPair(WETH, USDC);
-    const wethUsdcPair = await ethers.getContractAt(PAIR_ABI, wethUsdcPairAddr, trader);
-    const token0wu = await wethUsdcPair.token0();
-    const [wu0, wu1] = await wethUsdcPair.getReserves();
-    const [wethRes, usdcRes] = token0wu.toLowerCase() === WETH ? [wu0, wu1] : [wu1, wu0];
-    const wethPriceUSDC = Number(ethers.formatUnits(usdcRes, usdcDecimals)) / Number(ethers.formatEther(wethRes));
-    const priceBeforeUSDC = toFloat(priceBefore) * wethPriceUSDC;
-    const priceAfterUSDC = toFloat(priceAfter) * wethPriceUSDC;
-    const pct = percentChange(priceBefore, priceAfter);
+  const priceBefore = computePrice(wethReserve, tokenReserve);
+  const priceBeforeUSDC = toFloat(priceBefore) * wethPriceUSDC;
 
-    // ===== Profit + ROI =====
-    const tradeSizeWETH = Number(swapWeth);
-    const wethValueAfter = tokensReceived * toFloat(priceAfter);  // Value of tokens in WETH after swap
-    const profitWETH = wethValueAfter - tradeSizeWETH;
-    const profitUSDC = profitWETH * wethPriceUSDC;
-    const roi = (profitWETH / tradeSizeWETH) * 100;
+  // Swap calculation
+  console.log(`🔄 Swapping ${swapTokens} ${symbol}`);
+  const swapPath = [config.address, WETH];
+  const amountInWithFee = swapTokenBN * 997n / 1000n;
+  const numerator = amountInWithFee * wethReserve;
+  const denominator = tokenReserve + amountInWithFee;
+  const wethOutBN = numerator / denominator;
 
-    // ===== Display =====
-    displayResult({
-        tokenSymbol: symbol,
-        priceBefore,
-        priceAfter,
-        priceBeforeUSDC,
-        priceAfterUSDC,
-        percent: pct,
-        tokenReserveAfter,
-        wethReserveAfter,
-        tokenDecimals,
-        routerAddress: UNI_ROUTER,
-        routerPath: swapPath,
-        tradeWeth: swapWeth,
-        tokensReceived,
-        profitWETH,
-        profitUSDC,
-        roi
-    });
+  await router.connect(signer).swapExactTokensForTokens(
+    swapTokenBN,
+    0n,
+    swapPath,
+    whale,
+    BigInt(Math.floor(Date.now() / 1000) + 600)
+  );
+
+  // Reserves after swap
+  [r0, r1] = await pair.getReserves();
+  [tokenReserve, wethReserve] = token0.toLowerCase() === config.address ? [r0, r1] : [r1, r0];
+
+  const priceAfter = computePrice(wethReserve, tokenReserve);
+  const priceAfterUSDC = toFloat(priceAfter) * wethPriceUSDC;
+  const pct = percentChange(priceBefore, priceAfter);
+
+  // Realized profit
+  const profitWETH = Number(ethers.formatEther(wethOutBN)) - (Number(ethers.formatUnits(swapTokenBN, tokenDecimals)) * toFloat(priceBefore));
+  const profitUSDC = profitWETH * wethPriceUSDC;
+  const roi = (profitWETH / (Number(ethers.formatUnits(swapTokenBN, tokenDecimals)) * toFloat(priceBefore))) * 100;
+
+  displayResult({
+    tokenSymbol: symbol,
+    priceBefore,
+    priceAfter,
+    priceBeforeUSDC,
+    priceAfterUSDC,
+    percent: pct,
+    tokenReserveAfter: tokenReserve,
+    wethReserveAfter: wethReserve,
+    tokenDecimals,
+    routerAddress: UNI_ROUTER,
+    routerPath: swapPath,
+    profitWETH,
+    profitUSDC,
+    roi
+  });
 }
 
-runGenericPump("LINK").catch(console.error);
-// runGenericPump("LDO");
-// runGenericPump("AAVE");
-// runGenericPump("SHIB");
-// runGenericPump("ALCX").catch(console.error);
+// ===== Run test =====
+runGenericTest("LINK").catch(console.error);
+
+
+// runGenericTest("SHIB")
+// runGenericTest("LINK")
+// runGenericTest("AAVE")
+// runGenericTest("LINK")
