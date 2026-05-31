@@ -494,11 +494,23 @@ function calculateOptimalArbitrageTrade({
   // ------------------------------
   // Slippage cap (reserve-based)
   // ------------------------------
-  const maxTradeDueToSlippage = (buyReserveIn * maxImpactPercent) / 100n;
-  const upperBound = maxTrade < maxTradeDueToSlippage ? maxTrade : maxTradeDueToSlippage;
+  const limitingReserve = buyReserveIn < buyReserveOut ? buyReserveIn : buyReserveOut;
+  const maxTradeDueToSlippage =(limitingReserve * maxImpactPercent) / 100n;
+ 
+  // detect hard collapse first
+  if (maxTradeDueToSlippage < 10n) {
+    console.log("⚠️ EXTREME LIQUIDITY COMPRESSION DETECTED");
+  }
 
-  if (upperBound <= 0n) {
-    return { tradeSize: 0n, profit: 0n, maxAllowedTrade: 0n };
+  const upperBound =
+    maxTradeDueToSlippage === 0n
+      ? buyReserveIn / 1000n
+      : (maxTrade < maxTradeDueToSlippage ? maxTrade : maxTradeDueToSlippage);
+
+  // post-bound sanity check (this is the important one)
+  if (upperBound < 10n) {
+    console.log("⚠️ TRADE SIZE TOO SMALL (dust regime):", upperBound.toString());
+    return { tradeSize: 0n, profit: 0n, maxAllowedTrade: upperBound };
   }
 
   const FLASH_FEE_NUM = 9n;
@@ -530,6 +542,27 @@ function calculateOptimalArbitrageTrade({
 
   let bestTrade = 0n;
   let bestProfit = 0n;
+
+  if (upperBound < 50n) {
+    console.log("⚠️ MICRO-LIQUIDITY MODE: switching to linear scan");
+
+    let bestTrade = 0n;
+    let bestProfit = 0n;
+
+    for (let t = 1n; t <= upperBound; t++) {
+      const p = calcProfit(t);
+      if (p > bestProfit) {
+        bestProfit = p;
+        bestTrade = t;
+      }
+    }
+
+    return {
+      tradeSize: bestTrade,
+      profit: bestProfit,
+      maxAllowedTrade: upperBound
+    };
+  }
 
   while (left <= right) {
     const mid = (left + right) >> 1n;
@@ -596,9 +629,9 @@ async function estimateMaxProfit({
     // Swap 2
     // -------------------------
     const swap2Out = simulateSwap(
-      swap1Out,
-      sellReserveOut,
-      sellReserveIn
+      swap1Out,        // amountIn
+      sellReserveIn,   // reserveIn (FIXED ORDER)
+      sellReserveOut   // reserveOut
     );
 
     if (swap2Out <= 0n) return null;
