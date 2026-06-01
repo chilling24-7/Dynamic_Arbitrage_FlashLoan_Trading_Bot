@@ -1,4 +1,5 @@
 const { ethers } = require("ethers");
+const { formatUnits } = require("ethers");
 const IUniswapV2Pair = require("@uniswap/v2-core/build/IUniswapV2Pair.json");
 const chalk = require("chalk");
 
@@ -469,125 +470,16 @@ const FEE_NUM = 997n;
 const FEE_DEN = 1000n;
 
 function simulateSwap(amountIn, reserveIn, reserveOut) {
-  if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
+  const FEE_NUM = 997n;
+  const FEE_DEN = 1000n;
 
-  const amountInWithFee = (amountIn * FEE_NUM) / FEE_DEN;
+  if (amountIn <= 0n) return 0n;
+  if (reserveIn <= 0n || reserveOut <= 0n) return 0n;
 
-  const numerator = amountInWithFee * reserveOut;
-  const denominator = reserveIn + amountInWithFee;
+  const amountInWithFee = amountIn * FEE_NUM;
 
-  return denominator === 0n ? 0n : numerator / denominator;
-}
-
-function calculateOptimalArbitrageTrade({
-  buyReserveIn,
-  buyReserveOut,
-  sellReserveIn,
-  sellReserveOut,
-  maxTrade,
-  maxImpactPercent = 1n
-}) {
-  if (!buyReserveIn || !buyReserveOut || !sellReserveIn || !sellReserveOut) {
-    return { tradeSize: 0n, profit: 0n, maxAllowedTrade: 0n };
-  }
-
-  // ------------------------------
-  // Slippage cap (reserve-based)
-  // ------------------------------
-  const limitingReserve = buyReserveIn < buyReserveOut ? buyReserveIn : buyReserveOut;
-  const maxTradeDueToSlippage =(limitingReserve * maxImpactPercent) / 100n;
- 
-  // detect hard collapse first
-  if (maxTradeDueToSlippage < 10n) {
-    console.log("⚠️ EXTREME LIQUIDITY COMPRESSION DETECTED");
-  }
-
-  const upperBound =
-    maxTradeDueToSlippage === 0n
-      ? buyReserveIn / 1000n
-      : (maxTrade < maxTradeDueToSlippage ? maxTrade : maxTradeDueToSlippage);
-
-  // post-bound sanity check (this is the important one)
-  if (upperBound < 10n) {
-    console.log("⚠️ TRADE SIZE TOO SMALL (dust regime):", upperBound.toString());
-    return { tradeSize: 0n, profit: 0n, maxAllowedTrade: upperBound };
-  }
-
-  const FLASH_FEE_NUM = 9n;
-  const FLASH_FEE_DEN = 10000n;
-
-  // ------------------------------
-  // REAL profit function (CURVE BASED)
-  // ------------------------------
-  const calcProfit = (trade) => {
-    const out1 = simulateSwap(
-      trade,
-      buyReserveIn,
-      buyReserveOut
-    );
-
-    const out2 = simulateSwap(out1, sellReserveOut, sellReserveIn);
-
-    const flashFee = (trade * FLASH_FEE_NUM) / FLASH_FEE_DEN;
-    const profit = out2 - trade - flashFee;
-
-    return profit; // ⚠️ IMPORTANT: DO NOT CLIP HERE
-  };
-
-  // ------------------------------
-  // Binary search optimization
-  // ------------------------------
-  let left = 1n;
-  let right = upperBound;
-
-  let bestTrade = 0n;
-  let bestProfit = 0n;
-
-  if (upperBound < 50n) {
-    console.log("⚠️ MICRO-LIQUIDITY MODE: switching to linear scan");
-
-    let bestTrade = 0n;
-    let bestProfit = 0n;
-
-    for (let t = 1n; t <= upperBound; t++) {
-      const p = calcProfit(t);
-      if (p > bestProfit) {
-        bestProfit = p;
-        bestTrade = t;
-      }
-    }
-
-    return {
-      tradeSize: bestTrade,
-      profit: bestProfit,
-      maxAllowedTrade: upperBound
-    };
-  }
-
-  while (left <= right) {
-    const mid = (left + right) >> 1n;
-
-    const midProfit = calcProfit(mid);
-    const next = mid + 1n <= upperBound ? mid + 1n : mid;
-    const nextProfit = calcProfit(next);
-
-    if (midProfit > bestProfit) {
-      bestProfit = midProfit;
-      bestTrade = mid;
-    }
-
-    if (nextProfit > midProfit) {
-      left = mid + 1n;
-    } else {
-      right = mid - 1n;
-    }
-  }
-
-  return {
-    tradeSize: bestTrade,
-    profit: bestProfit,
-    maxAllowedTrade: upperBound
-  };
+  return (amountInWithFee * reserveOut) /
+         (reserveIn * FEE_DEN + amountInWithFee);
 }
 
 // ----------------- Estimate Max Profit -----------------
@@ -617,22 +509,41 @@ async function estimateMaxProfit({
     // -------------------------
     // Swap 1
     // -------------------------
+    console.log("BUY PRICE CHECK", {
+      reserveIn: buyReserveIn.toString(),
+      reserveOut: buyReserveOut.toString(),
+      spotPrice:
+        Number(buyReserveIn) /
+        Number(buyReserveOut)
+    });
+
+    // WETH -> Token
     const swap1Out = simulateSwap(
       tradeSize,
-      buyReserveIn,
-      buyReserveOut
+      buyReserveIn,   // WETH
+      buyReserveOut   // Token
     );
 
-    if (swap1Out <= 0n) return null;
+    console.log("SWAP1", {
+      tradeSize: tradeSize.toString(),
+      buyReserveIn: buyReserveIn.toString(),
+      buyReserveOut: buyReserveOut.toString(),
+      swap1Out: swap1Out.toString()
+    });
 
-    // -------------------------
-    // Swap 2
-    // -------------------------
+    // Token -> WETH
     const swap2Out = simulateSwap(
-      swap1Out,        // amountIn
-      sellReserveIn,   // reserveIn (FIXED ORDER)
-      sellReserveOut   // reserveOut
+      swap1Out,
+      sellReserveOut, // Token
+      sellReserveIn   // WETH
     );
+
+    console.log("SWAP2", {
+      swap1Out: swap1Out.toString(),
+      sellReserveOut: sellReserveOut.toString(),
+      sellReserveIn: sellReserveIn.toString(),
+      swap2Out: swap2Out.toString()
+    });
 
     if (swap2Out <= 0n) return null;
 
@@ -654,6 +565,20 @@ async function estimateMaxProfit({
       swap2Out - tradeSize - flashFee - gasCostInWei;
 
     const netProfit = rawProfit > 0n ? rawProfit : 0n;
+    //console.log("PROFIT BREAKDOWN", {
+    //  swap2Out: swap2Out.toString(),
+    //  tradeSize: tradeSize.toString(),
+    //  flashFee: flashFee.toString(),
+    //  gasCostInWei: gasCostInWei.toString(),
+    //  rawProfit: rawProfit.toString()
+    //});
+
+    console.log({
+      tradeWeth: formatUnits(tradeSize, 18),
+      linkOut: formatUnits(swap1Out, 18),
+      wethBack: formatUnits(swap2Out, 18),
+      profit: formatUnits(rawProfit, 18)
+    });
 
     return {
       swap1Out,
@@ -678,8 +603,7 @@ module.exports = {
   getWethReserve,
   evaluateLiquidity,
   getFlashLoanSize,
-  calculateOptimalArbitrageTrade,
   estimateMaxProfit
 };
 
-///// Works and up to date
+///// Works and up to date!!
