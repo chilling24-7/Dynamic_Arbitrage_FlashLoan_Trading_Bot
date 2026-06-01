@@ -33,7 +33,6 @@ const {
   getReserves,
   getWethReserve,
   estimateMaxProfit,
-  calculateOptimalArbitrageTrade,
   getFlashLoanSize,
 } = require("./helpers/helpers");
 
@@ -1050,24 +1049,59 @@ async function swapEvent(params) {
         const uniIn = uni?.reserveIn ?? 0n;
         const sushiIn = sushi?.reserveIn ?? 0n;
 
+        // ------------------------------
+        // 🔒 CONDITIONAL HARD LIQUIDITY FLOOR & IMPACT CHECK
+        // ------------------------------
+        if (networkType !== "FORK") {
+          const MIN_LIQUIDITY = 10n ** 17n; // 0.1 WETH
+          const MAX_IMPACT_BPS = 200n; // 2%
+
+          if (uniIn < MIN_LIQUIDITY || sushiIn < MIN_LIQUIDITY) {
+            console.log(`❌ Skipping shallow pool | Uni=${uniIn} Sushi=${sushiIn}`);
+            continue;
+          }
+
+          const impactUni = uniIn > 0n ? (amountIn * 10000n) / uniIn : 10_000n;
+          const impactSushi = sushiIn > 0n ? (amountIn * 10000n) / sushiIn : 10_000n;
+
+          if (impactUni > MAX_IMPACT_BPS || impactSushi > MAX_IMPACT_BPS) {
+            console.log(`❌ Skipping high impact trade | Uni=${impactUni}bps Sushi=${impactSushi}bps`);
+            continue;
+          }
+        }
+
+        // ------------------------------
+        // Now safe to compare pools or log
+        // ------------------------------
         const reserveIn = uniIn > sushiIn ? uniIn : sushiIn;
-        if (reserveIn <= 0n) continue;
 
         const SCALE = 1_000_000_000n;
         const impactScaled = (amountIn * SCALE) / reserveIn;
         const impactPct = Number(impactScaled) / 1e7;
 
+        // ------------------------------
+        // IMPACT CLASSIFICATION (fixed sensitivity)
+        // ------------------------------
         let signal = "NORMAL";
-        if (impactScaled < 1_000_000n) signal = "LOW";
-        else if (impactScaled < 5_000_000n) signal = "GOOD";
-        else if (impactScaled < 20_000_000n) signal = "HIGH";
-        else signal = "EXTREME";
+
+        if (impactScaled < 10_000n) signal = "MICRO";        // <0.001%
+        else if (impactScaled < 50_000n) signal = "LOW";     // 0.001% – 0.005%
+        else if (impactScaled < 250_000n) signal = "GOOD";   // 0.005% – 0.025%
+        else if (impactScaled < 2_000_000n) signal = "HIGH"; // 0.025% – 0.2%
+        else signal = "EXTREME";                              // >0.2%
 
         console.log(`📊 Reserve Signal → Swap Size Relative To Reserve = ${impactPct.toFixed(6)}% | Signal=${signal}`);
-        console.log(`📊 IMPACT DEBUG → raw=${amountIn.toString()} preSwapReserve=${reserveIn.toString()} scaled=${impactScaled.toString()}`);
+        console.log(
+          `📊 IMPACT DEBUG → raw=${amountIn.toString()} ` +
+          `reserve=${reserveIn.toString()} ` +
+          `scaled=${impactScaled.toString()} ` +
+          `impact=${impactPct.toFixed(6)}% ` +
+          `signal=${signal} ` +
+          `gate=${impactScaled >= 25_000n ? "PASS" : "BLOCK"}`
+        );
         console.log(ORANGE + "═══════════════════════════════════════════════════════════" + RESET);
 
-        if (impactScaled < 500_000n) continue;      // 0.05%
+        if (impactScaled < 25_000n) continue;      // 0.0025%
         if (impactScaled > 200_000_000n) continue;   // 20%
 
         // ============================================================
@@ -1095,8 +1129,7 @@ async function swapEvent(params) {
 
           if (!direction) continue;
 
-          const avgWethPrice =
-            (direction.uniWethPriceUSDC + direction.sushiWethPriceUSDC) / 2;
+          const avgWethPrice = (direction.uniWethPriceUSDC + direction.sushiWethPriceUSDC) / 2;
 
           const arbResult = await determineProfit({
             baseToken: direction.baseToken,
@@ -1113,7 +1146,7 @@ async function swapEvent(params) {
             sushiWethPerTokenEnd: direction.sushiWethPerTokenEnd
           });
 
-          if (!arbResult || arbResult.profit <= 0n) continue;
+          if (!arbResult?.profitable || arbResult.tradeAmount <= 0n) continue;
 
           const result = await executeTrade({
             startOnUniswap: direction.routerPath[0] === uRouter,
@@ -1165,7 +1198,7 @@ async function determineDirection(
   pairLiquidityMap,
   oneSidedPairsMap,
   minWethReserve = 5n * 10n ** 18n,
-  spreadThreshold = .2,
+  spreadThreshold = 0.2,
   snapshot = null,
   preFetchedReserves = null
 ) {
@@ -1179,85 +1212,51 @@ async function determineDirection(
     border();
 
     if (typeof eventAmountIn !== "bigint") eventAmountIn = BigInt(eventAmountIn.toString());
-    const oneOutput = 10n ** BigInt(outputToken.decimals);
 
     console.log(`\n📢 Swap Event Detected: ${inputToken.symbol} → ${outputToken.symbol}`);
     console.log(`Event Amount In: ${ethers.formatUnits(eventAmountIn, Number(inputToken.decimals))}`);
 
     const baseToken = topTokens.find(t => t.symbol === "WETH");
+    if (!baseToken) return console.log("⚠️ No WETH in pair. Skipping.");
+
     const targetToken = inputToken.symbol === "WETH" ? outputToken : inputToken;
-    const bridgeToken = null;
-    const useBridge = false;
-    const fmt = (x, d = 6) => typeof x === "number" && isFinite(x) ? x.toFixed(d) : "NaN";
-    const safePct = (a, b) => a && b ? ((b - a) / a) * 100 : 0;
- 
-    if (!baseToken || baseToken.symbol !== "WETH") {
-      console.log("⚠️ No WETH in pair. Skipping.");
-      return null;
-    }
+    const isBaseInput = inputToken.address.toLowerCase() === baseToken.address.toLowerCase();
 
     // ------------------- RESERVES -------------------
     const uniPair = await getReserves(uFactory, baseToken, targetToken, provider);
     const sushiPair = await getReserves(sFactory, baseToken, targetToken, provider);
+    if (!uniPair || !sushiPair) return console.log("❌ Missing pair data");
 
-    if (!uniPair || !sushiPair) {
-      console.log("❌ Missing pair data");
-      return null;
-    }
-
-    // ------------------- KEEP YOUR VARIABLES -------------------
     const uReserveBase = BigInt(uniPair.reserveA);
     const uReserveTarget = BigInt(uniPair.reserveB);
-
     const sReserveBase = BigInt(sushiPair.reserveA);
     const sReserveTarget = BigInt(sushiPair.reserveB);
 
-    // ------------------- ALSO BUILD STRUCTURED OUTPUT -------------------
-    const startingReserves = {
-      uBase: uReserveBase,
-      uTarget: uReserveTarget,
-      sBase: sReserveBase,
-      sTarget: sReserveTarget
-    };
+    const startingReserves = { uBase: uReserveBase, uTarget: uReserveTarget, sBase: sReserveBase, sTarget: sReserveTarget };
 
-    // ------------------- WETH → USDC PRICE (FIXED, ORDER SAFE) -------------------
+    // ------------------- WETH → USDC PRICE -------------------
     const uUsdcRes = await getReserves(uFactory, baseToken, usdcToken, provider);
     const sUsdcRes = await getReserves(sFactory, baseToken, usdcToken, provider);
 
     const getWethPriceInUSDC = (res) => {
-      if (!res || res.reserveA === 0n || res.reserveB === 0n) return 0;
-
-      const addrA = res.token0?.toLowerCase?.();
-      const addrB = res.token1?.toLowerCase?.();
-
+      if (!res) return 0;
       const wethAddr = baseToken.address.toLowerCase();
-
-      const wethIsA = addrA === wethAddr;
-
-      const wethReserve = wethIsA ? res.reserve0 : res.reserve1;
-      const usdcReserve = wethIsA ? res.reserve1 : res.reserve0;
-
-      if (!wethReserve || !usdcReserve) return 0;
-
-      return (
-        Number(ethers.formatUnits(usdcReserve, usdcToken.decimals)) /
-        Number(ethers.formatEther(wethReserve))
-      );
+      const wethReserve = res.token0.toLowerCase() === wethAddr ? res.reserve0 : res.reserve1;
+      const usdcReserve = res.token0.toLowerCase() === wethAddr ? res.reserve1 : res.reserve0;
+      return Number(ethers.formatUnits(usdcReserve, usdcToken.decimals)) / Number(ethers.formatEther(wethReserve));
     };
 
     const uniWethPriceUSDC = getWethPriceInUSDC(uUsdcRes);
     const sushiWethPriceUSDC = getWethPriceInUSDC(sUsdcRes);
 
-    // ------------------- SIMULATE EVENT -------------------
+    // ------------------- SIMULATE SWAP -------------------
     function simulateSwap(reserveIn, reserveOut, amountIn) {
       const amountInWithFee = (amountIn * 997n) / 1000n;
       const amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
       return { newReserveIn: reserveIn + amountIn, newReserveOut: reserveOut - amountOut };
     }
 
-    let endingReserves = { ...startingReserves };
-    const isBaseInput = inputToken.address.toLowerCase() === baseToken.address.toLowerCase();
-
+    const endingReserves = { ...startingReserves };
     if (eventDex.toLowerCase() === "uniswap") {
       const swap = isBaseInput ? simulateSwap(uReserveBase, uReserveTarget, eventAmountIn) : simulateSwap(uReserveTarget, uReserveBase, eventAmountIn);
       endingReserves.uBase = isBaseInput ? swap.newReserveIn : swap.newReserveOut;
@@ -1268,139 +1267,113 @@ async function determineDirection(
       endingReserves.sTarget = isBaseInput ? swap.newReserveOut : swap.newReserveIn;
     }
 
-    // ------------------- PRICE CALC -------------------
+    // ------------------- PRICE PER TOKEN (BIGINT SAFE) -------------------
+
     const SCALED = 10n ** BigInt(targetToken.decimals);
 
+    // WETH per TOKEN (AMM price = reserveWETH / reserveTOKEN)
     const uniWethPerTokenStart = startingReserves.uTarget > 0n ? (startingReserves.uBase * SCALED) / startingReserves.uTarget : 0n;
-    const sushiWethPerTokenStart = startingReserves.sTarget > 0n ? (startingReserves.sBase * SCALED) / startingReserves.sTarget : 0n;
     const uniWethPerTokenEnd = endingReserves.uTarget > 0n ? (endingReserves.uBase * SCALED) / endingReserves.uTarget : 0n;
+    const sushiWethPerTokenStart = startingReserves.sTarget > 0n ? (startingReserves.sBase * SCALED) / startingReserves.sTarget : 0n;
     const sushiWethPerTokenEnd = endingReserves.sTarget > 0n ? (endingReserves.sBase * SCALED) / endingReserves.sTarget : 0n;
 
-    const uniUsdcPerTokenStart = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenStart, targetToken.decimals)) * uniWethPriceUSDC : NaN;
-    const sushiUsdcPerTokenStart = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenStart, targetToken.decimals)) * sushiWethPriceUSDC : NaN;
-    const uniUsdcPerTokenEnd = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenEnd, targetToken.decimals)) * uniWethPriceUSDC: NaN;
-    const sushiUsdcPerTokenEnd = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenEnd, targetToken.decimals)) * sushiWethPriceUSDC : NaN;
+    const uniUsdcPerTokenStart = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenStart, targetToken.decimals)) * uniWethPriceUSDC : 0;
+    const uniUsdcPerTokenEnd = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenEnd, targetToken.decimals)) * uniWethPriceUSDC : 0;
+    const sushiUsdcPerTokenStart = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenStart, targetToken.decimals)) * sushiWethPriceUSDC : 0;
+    const sushiUsdcPerTokenEnd = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenEnd, targetToken.decimals)) * sushiWethPriceUSDC : 0;
 
-    // ------------------- DIRECTIONAL LIQUIDITY CHECK -------------------
-    const isUni = eventDex.toLowerCase() === "uniswap";
-
-    // pick correct pool side
-    const exitReserveBefore = isUni
-      ? (isBaseInput ? uReserveTarget : uReserveBase)
-      : (isBaseInput ? sReserveTarget : sReserveBase);
-
-    const exitReserveAfter = isUni
-      ? (isBaseInput ? endingReserves.uTarget : endingReserves.uBase)
-      : (isBaseInput ? endingReserves.sTarget : endingReserves.sBase);
-
-    // 30% minimum retained liquidity
-    const LIQUIDITY_COLLAPSE_THRESHOLD = 30n;
-
-    const minSafeExitLiquidity =
-      (exitReserveBefore * LIQUIDITY_COLLAPSE_THRESHOLD) / 100n;
-
-    if (exitReserveAfter < minSafeExitLiquidity) {
-      console.log(
-        `❌ Skipping: exit liquidity collapse too large ` +
-        `| before=${exitReserveBefore.toString()} ` +
-        `| after=${exitReserveAfter.toString()}`
-      );
-      return null;
-    }
-
-    // ------------------- SPREAD & LIQUIDITY -------------------
-
-    const buyPrice =
-      uniWethPerTokenEnd < sushiWethPerTokenEnd
-        ? uniWethPerTokenEnd
-        : sushiWethPerTokenEnd;
-
-    const sellPrice =
-      uniWethPerTokenEnd > sushiWethPerTokenEnd
-        ? uniWethPerTokenEnd
-        : sushiWethPerTokenEnd;
-
-    // True arbitrage spread
-    const spreadBps =
-      buyPrice > 0n ? ((sellPrice - buyPrice) * 10_000n) / buyPrice : 0n;
-
+    // ------------------- SPREAD -------------------
+    const buyPrice = uniWethPerTokenEnd < sushiWethPerTokenEnd ? uniWethPerTokenEnd : sushiWethPerTokenEnd;
+    const sellPrice = uniWethPerTokenEnd > sushiWethPerTokenEnd ? uniWethPerTokenEnd : sushiWethPerTokenEnd;
+    const spreadBps = buyPrice > 0n ? ((sellPrice - buyPrice) * 10_000n) / buyPrice : 0n;
     const pctWeth = Number(spreadBps) / 100;
 
-    const signedSpread =
-      uniWethPerTokenEnd > sushiWethPerTokenEnd ? pctWeth : -pctWeth;
-
-    // ONLY liquidity status (no recalculating execution logic)
-    const uniLiquidity = evaluateLiquidity({
-      reserveBase: endingReserves.uBase,
-      minWethReserve,
-      dexName: "Uniswap"
-    });
-
-    const sushiLiquidity = evaluateLiquidity({
-      reserveBase: endingReserves.sBase,
-      minWethReserve,
-      dexName: "Sushi"
-    });
-
-    // FINAL COMBINED CHECK (pure decision layer)
+    // ------------------- LIQUIDITY -------------------
+    const uniLiquidity = evaluateLiquidity({ reserveBase: endingReserves.uBase, minWethReserve, dexName: "Uniswap" });
+    const sushiLiquidity = evaluateLiquidity({ reserveBase: endingReserves.sBase, minWethReserve, dexName: "Sushi" });
     const liquidityPassed = uniLiquidity.valid && sushiLiquidity.valid;
-    const spreadPassed = Math.abs(pctWeth) >= Number(spreadThreshold);
-    const crossDexSpread = pctWeth;
+    const spreadPassed = Math.abs(pctWeth) >= spreadThreshold;
+
     const uniWethReserve = getWethReserve(uniPair, baseToken.address);
     const sushiWethReserve = getWethReserve(sushiPair, baseToken.address);
 
-    // ------------------- LOGGING -------------------
+    // ------------------- LOGGING (DIRECTION-AWARE HUMAN MODEL) -------------------
 
-    const scale = targetToken.decimals;
+    const toNum = (x) => Number(x);
 
-    const fmtPrice = (x, decimals = 18, display = 18) => {
-    if (!x || x === 0n) return "0";
-
-      return parseFloat(ethers.formatUnits(x, decimals)).toFixed(display);
+    const pricePerTokenWeth = (wethReserve, tokenReserve) => {
+      if (tokenReserve <= 0n) return 0;
+      return toNum(ethers.formatEther(wethReserve)) /
+             toNum(ethers.formatUnits(tokenReserve, targetToken.decimals));
     };
 
-    const pctChange = (a, b, decimals = 18) => {
-      if (a <= 0n) return "0.00";
+    const pricePerTokenUsdc = (wethPerToken) => wethPerToken * uniWethPriceUSDC;
 
-      const aNum = parseFloat(ethers.formatUnits(a, decimals));
-      const bNum = parseFloat(ethers.formatUnits(b, decimals));
+    const isUniAffected = eventDex.toLowerCase() === "uniswap";
 
-      return (((bNum - aNum) / aNum) * 100).toFixed(2);
-    };
+    // ---- UNISWAP PRICES ----
+    const uniWethBefore = pricePerTokenWeth(startingReserves.uBase, startingReserves.uTarget);
+    const uniWethAfter  = pricePerTokenWeth(endingReserves.uBase, endingReserves.uTarget);
 
-    const logDexPrices = (dex, wethStart, wethEnd,usdStart, usdEnd) => {
-      console.log(`\n${dex}:`);
+    const uniUsdcBefore = pricePerTokenUsdc(uniWethBefore);
+    const uniUsdcAfter  = pricePerTokenUsdc(uniWethAfter);
 
-      console.log(`  BEFORE → ${fmtPrice(wethStart, targetToken.decimals, 18)} WETH ` + `| ${fmt(usdStart)} USD`);
+    // ---- SUSHI PRICES ----
+    const sushiWethBefore = pricePerTokenWeth(startingReserves.sBase, startingReserves.sTarget);
+    const sushiWethAfter  = pricePerTokenWeth(endingReserves.sBase, endingReserves.sTarget);
 
-      console.log(
-        `  AFTER  → ${fmtPrice(wethEnd, targetToken.decimals, 18)} WETH ` +
-        `(${pctChange(wethStart, wethEnd, targetToken.decimals)}%) ` +
-        `| ${fmt(usdEnd)} USD ` +
-        `(${fmt(((usdEnd - usdStart) / (usdStart || 1)) * 100, 2)}%)`
-      );
-    };
+    const sushiUsdcBefore = pricePerTokenUsdc(sushiWethBefore);
+    const sushiUsdcAfter  = pricePerTokenUsdc(sushiWethAfter);
 
-    console.log("\n💸 Price Impact Summary");
+    // ---- PCT CHANGE ----
+    const pctChange = (before, after) =>
+      before > 0 ? (((after - before) / before) * 100).toFixed(4) : "0.0000";
 
-    logDexPrices("Uniswap", uniWethPerTokenStart, uniWethPerTokenEnd, uniUsdcPerTokenStart, uniUsdcPerTokenEnd);
-    logDexPrices("Sushi", sushiWethPerTokenStart, sushiWethPerTokenEnd, sushiUsdcPerTokenStart, sushiUsdcPerTokenEnd);
+    console.log("\n💸 Price BEFORE Swap");
 
-    console.log(`\n🔺 Direct Arb Spread: ${crossDexSpread.toFixed(2)}%`);
+    console.log(`Uniswap:`);
+    console.log(`1 ${targetToken.symbol} ≈ ${uniWethBefore.toFixed(18)} WETH`);
+    console.log(`1 ${targetToken.symbol} ≈ ${uniUsdcBefore.toFixed(6)} USDC`);
+
+    console.log(`Sushi:`);
+    console.log(`1 ${targetToken.symbol} ≈ ${sushiWethBefore.toFixed(18)} WETH`);
+    console.log(`1 ${targetToken.symbol} ≈ ${sushiUsdcBefore.toFixed(6)} USDC`);
+
+    console.log("\n💸 Price AFTER Swap");
+
+    // ONLY affected DEX updates
+    if (isUniAffected) {
+      console.log(`Uniswap:`);
+      console.log(`1 ${targetToken.symbol} ≈ ${uniWethAfter.toFixed(18)} WETH`);
+      console.log(`1 ${targetToken.symbol} ≈ ${uniUsdcAfter.toFixed(6)} USDC`);
+
+      console.log(`Sushi:`);
+      console.log(`1 ${targetToken.symbol} ≈ ${sushiWethBefore.toFixed(18)} WETH`);
+      console.log(`1 ${targetToken.symbol} ≈ ${sushiUsdcBefore.toFixed(6)} USDC`);
+    } else {
+      console.log(`Uniswap:`);
+      console.log(`1 ${targetToken.symbol} ≈ ${uniWethBefore.toFixed(18)} WETH`);
+      console.log(`1 ${targetToken.symbol} ≈ ${uniUsdcBefore.toFixed(6)} USDC`);
+
+      console.log(`Sushi:`);
+      console.log(`1 ${targetToken.symbol} ≈ ${sushiWethAfter.toFixed(18)} WETH`);
+      console.log(`1 ${targetToken.symbol} ≈ ${sushiUsdcAfter.toFixed(6)} USDC`);
+    }
+
+    console.log("\n📊 Price Change");
+
+    console.log(`Uniswap Δ %: ${pctChange(uniWethBefore, uniWethAfter)}%`);
+    console.log(`Sushi Δ %:   ${pctChange(sushiWethBefore, sushiWethAfter)}%`);
+
+    console.log(`\n🔺 Direct Arb Spread: ${pctWeth.toFixed(2)}%`);
 
     console.log("\n📈 Reserves");
     console.log(`Uniswap WETH Reserve: ${ethers.formatEther(uniWethReserve)}`);
     console.log(`Sushi WETH Reserve: ${ethers.formatEther(sushiWethReserve)}`);
 
     console.log(`\n💧 Liquidity Status: ${liquidityPassed ? "Passed ✅" : "Failed ❌"}`);
-    if (!liquidityPassed) {
-      console.log("❌ Liquidity failure breakdown:");
-      console.log("  Uniswap valid:", uniLiquidity.valid);
-      console.log("  Sushi valid:", sushiLiquidity.valid);
-      console.log("  Execution OK:", executionLiquidityPassed);
-    }
     console.log(`📊 Spread Status: ${spreadPassed ? "Passed ✅" : `Failed ❌ (${pctWeth.toFixed(2)}%)`}`);
-    console.log(`📊 Cross-DEX Spread: ${crossDexSpread.toFixed(2)}%`);
+
     border();
 
     if (!liquidityPassed || !spreadPassed) return null;
@@ -1408,11 +1381,6 @@ async function determineDirection(
     // ------------------- TRADE PATH -------------------
     const routerPath = uniWethPerTokenEnd > sushiWethPerTokenEnd ? [sRouter, uRouter] : [uRouter, sRouter];
     const routerNames = uniWethPerTokenEnd > sushiWethPerTokenEnd ? ["Sushi", "Uniswap"] : ["Uniswap", "Sushi"];
-    const tradePath = [
-      { inToken: baseToken, outToken: targetToken, router: routerPath[0] },
-      { inToken: targetToken, outToken: baseToken, router: routerPath[1] }
-    ];
-
     console.log("\n💸 Arbitrage Trade Path:");
     console.log(`${baseToken.symbol} → ${targetToken.symbol} → ${baseToken.symbol}`);
     console.log(`Execution Routers: ${routerNames.join(" → ")}`);
@@ -1439,7 +1407,8 @@ async function determineDirection(
       sushiWethPriceUSDC,
       liquidityPassed,
       spreadPassed,
-      tradePath
+      uniWethReserve,
+      sushiWethReserve
     };
 
   } catch (err) {
@@ -1521,32 +1490,81 @@ async function determineProfit({
     sellReserveIn  = sell.in;
     sellReserveOut = sell.out;
 
-    // ------------------ Max Flash Loan ------------------
-    const flashLoanMax = getFlashLoanSize(networkType);
+    // ------------------ Max Flash Loan & Slippage-Limited Trade ------------------
+    // Ensure flashLoanMax is BigInt (in smallest units, e.g., wei)
+    const flashLoanMax = getFlashLoanSize(networkType); 
     console.log(
       "Flash Loan Max:",
       ethers.formatUnits(flashLoanMax, baseToken.decimals),
       baseToken.symbol
     );
 
-    // ------------------ Optimal Trade ------------------
-    const maxImpactTrade = (buyReserveIn * maxSlippagePercent) / 100n;
+    // Ensure maxSlippagePercent is BigInt
+    const maxSlippageBps = maxSlippagePercent * 100n; // <-- all BigInt math
+
+    if (maxSlippageBps <= 0n) throw new Error("maxSlippagePercent must be > 0");
+
+    // Compute max trade allowed to respect slippage
+    const maxImpactTrade = (buyReserveIn * maxSlippageBps) / 10000n; // divide by 10000 bps
     const cappedMaxTrade = flashLoanMax < maxImpactTrade ? flashLoanMax : maxImpactTrade;
 
-    const { tradeSize, profit } = calculateOptimalArbitrageTrade({
+    // ------------------ Optimal Trade (BigInt, no helper) ------------------
+    // price ratio: sell / buy
+    // using constant product formula: x * y = k
+    // tradeSize = sqrt((buyReserveIn * sellReserveOut * 1e18) / (buyReserveOut * sellReserveIn)) - buyReserveIn
+    // simplified approximation for small trades
+
+    function getOptimalTrade(buyIn, buyOut, sellIn, sellOut, maxTrade) {
+      if (buyIn <= 0n || buyOut <= 0n || sellIn <= 0n || sellOut <= 0n) {
+        return { tradeSize: 0n, profit: 0n };
+      }
+
+      // compute rough trade size using reserves
+      // tradeSize = ((sqrt(buyIn * sellOut * 1e18 / sellIn * buyOut)) - buyIn)
+      // we'll approximate: small trades only
+      // amountOut = (trade * sellOut) / (sellIn + trade)
+      // profit = amountOut - trade
+
+      const one18 = 10n ** 18n;
+
+      // use maxTrade as starting point
+      const trade = maxTrade;
+
+      // simulate amountOut on sell DEX
+      const amountOut = (trade * sellOut) / (sellIn + trade);
+
+      // profit in base token
+      const profit = amountOut - trade;
+
+      if (profit <= 0n) {
+        return { tradeSize: 0n, profit: 0n };
+      }
+
+      return { tradeSize: trade, profit };
+    }
+
+    const { tradeSize, profit } = getOptimalTrade(
       buyReserveIn,
       buyReserveOut,
       sellReserveIn,
       sellReserveOut,
-      maxTrade: cappedMaxTrade,
-      maxImpactPercent: maxSlippagePercent
-    });
+      cappedMaxTrade
+    );
 
-    // ------------------ Slippage-Limited Max Trade ------------------
+    // ------------------ Final Max Trade Allowed ------------------
     const maxTradeAllowed = tradeSize <= maxImpactTrade ? tradeSize : maxImpactTrade;
 
-    console.log("Max Trade Allowed (Slippage Cap):", ethers.formatUnits(maxTradeAllowed, baseToken.decimals), baseToken.symbol);
-    console.log("Flash Loan Used:", ethers.formatUnits(maxTradeAllowed, baseToken.decimals), baseToken.symbol, "\n" );
+    console.log(
+      "Max Trade Allowed (Slippage Cap):",
+      ethers.formatUnits(maxTradeAllowed, baseToken.decimals),
+      baseToken.symbol
+    );
+    console.log(
+      "Flash Loan Used:",
+      ethers.formatUnits(maxTradeAllowed, baseToken.decimals),
+      baseToken.symbol,
+      "\n"
+    );
 
     if (tradeSize <= 0n || profit <= 0n) {
       console.log("No arbitrage opportunity or profit is 0.");
@@ -1571,7 +1589,7 @@ async function determineProfit({
     }
 
     // ------------------ PROFIT CAP ($10 min) ------------------
-    const MAX_PROFIT_USD = 10;
+    const MAX_PROFIT_USD = 5;
 
     // convert WETH profit → USD
     const profitInWeth = Number(ethers.formatUnits(estimate.profit, 18));
@@ -1589,7 +1607,7 @@ async function determineProfit({
 
     // ❌ EARLY EXIT (correct)
     if (!isAboveMinProfit) {
-      console.log("Arbitrage Profitable: NO ❌ (below $10 threshold)");
+      console.log("Arbitrage Profitable: NO ❌ (below $5 threshold)");
 
       return {
         profitable: false,
@@ -1624,9 +1642,10 @@ async function determineProfit({
 
     return {
       profitable: true,
-      tradeAmount: tradeSize,
-      profitWETH: estimate.profit,
-      profitUSDC,
+      reason: "ABOVE_MIN_PROFIT_THRESHOLD",
+      tradeAmount: maxTradeAllowed,
+      profit: estimate.profit,
+      profitUsd: profitInUsd,
       slippageBps
     };
 
@@ -1727,4 +1746,4 @@ async function executeTrade({
 // ─────────────────────────────────────────
 main().catch(console.error);
 
-// Works !! bot works on both pump and dump tests and when on Mainnet!!
+// Works !! Both Pump and Dump tests work. Works on Mainnet too it seems. 
