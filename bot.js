@@ -1198,7 +1198,7 @@ async function determineDirection(
   pairLiquidityMap,
   oneSidedPairsMap,
   minWethReserve = 5n * 10n ** 18n,
-  spreadThreshold = 0.2,
+  spreadThreshold = 1.0,
   snapshot = null,
   preFetchedReserves = null
 ) {
