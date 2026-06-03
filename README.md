@@ -64,7 +64,7 @@ Then install ethers:
 npx hardhat compile (should work) 
 Will need to create a .env file with the needed variables. 
 
-Then install this:
+Then install may be needed, but have worked without doing it:
 - npm install --save-dev @nomicfoundation/hardhat-ethers
 
 List of other dependencies that are needed:
