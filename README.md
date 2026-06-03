@@ -39,8 +39,14 @@ With the way the world is going, I wanted to share what I did and show what I ha
 
 ## Setting Up a new Project
 ### 1. Clone/Download the Repository
+git clone https://github.com/chilling24-7/Dynamic_Arbitrage_FlashLoan_Trading_Bot.git
 
 ### 2. Install Dependencies:
+
+Start a new project:
+npx hardhat --init
+
+Start hardhat v2 (older version)
 
 Install HardHat version 2:
 npm install --save-dev hardhat@^2.0.0
@@ -52,17 +58,25 @@ Install NVM:
 nvm install 22.10.0
 nvm use 22
 
-Install Node v18:
-npm install 18
-npm use 18
-
-npx hardhat compile (should work) 
-
 Then install ethers:
 npm install ethers@6
 
+npx hardhat compile (should work) 
+Will need to create a .env file with the needed variables. 
+
 Then install this:
 npm install --save-dev @nomicfoundation/hardhat-ethers
+
+List of other dependencies that are needed:
+- npm install --save-dev \
+	@openzeppelin/contracts@4.9.6 \
+	@uniswap/v2-core@1.0.1 \
+	@uniswap/v2-periphery@1.1.0-beta.0 \
+	@balancer-labs/v2-interfaces@0.4.0 \
+	@nomicfoundation/hardhat-toolbox@6.1.2 \
+	hardhat@2.28.6
+
+Optional if you want to try making the bot be a backrunner: 
 
 Then install this to allow backrunner bundles:
 npm install @flashbots/ethers-provider-bundle or yarn add @flashbots/ethers-provider-bundle or npm install ethers@6 @flashbots/ethers-provider-bundle
@@ -218,4 +232,4 @@ Be sure to check their documentation for latest updates regarding their contract
 
 ### Additional Notes
 
-- If testing out the *manipulate.js* script, you'll also want to update the **UNLOCKED_ACCOUNT** variable and adjust **AMOUNT** as needed.
+- All tests should work, but some variables may need to be adjusted like threshold
