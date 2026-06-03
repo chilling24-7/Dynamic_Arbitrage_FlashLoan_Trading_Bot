@@ -44,28 +44,28 @@ git clone https://github.com/chilling24-7/Dynamic_Arbitrage_FlashLoan_Trading_Bo
 ### 2. Install Dependencies:
 
 Start a new project:
-npx hardhat --init
+- npx hardhat --init
 
 Start hardhat v2 (older version)
 
 Install HardHat version 2:
-npm install --save-dev hardhat@^2.0.0
+- npm install --save-dev hardhat@^2.0.0
 
 Install a Specific version 2:
-npm install --save-dev hardhat@2.10.0 
+- npm install --save-dev hardhat@2.10.0 
 
 Install NVM:
-nvm install 22.10.0
-nvm use 22
+- nvm install 22.10.0
+- nvm use 22
 
 Then install ethers:
-npm install ethers@6
+- npm install ethers@6
 
 npx hardhat compile (should work) 
 Will need to create a .env file with the needed variables. 
 
 Then install this:
-npm install --save-dev @nomicfoundation/hardhat-ethers
+- npm install --save-dev @nomicfoundation/hardhat-ethers
 
 List of other dependencies that are needed:
 - npm install --save-dev \
@@ -79,10 +79,10 @@ List of other dependencies that are needed:
 Optional if you want to try making the bot be a backrunner: 
 
 Then install this to allow backrunner bundles:
-npm install @flashbots/ethers-provider-bundle or yarn add @flashbots/ethers-provider-bundle or npm install ethers@6 @flashbots/ethers-provider-bundle
+- npm install @flashbots/ethers-provider-bundle or yarn add @flashbots/ethers-provider-bundle or npm install ethers@6 @flashbots/ethers-provider-bundle
 
 To remove or uninstall:
-npm uninstall @flashbots/ethers-provider-bundle (if you need to remove it)
+- npm uninstall @flashbots/ethers-provider-bundle (if you need to remove it)
 
 ### 3. Create and Setup .env
 Before running any scripts, you'll want to create a .env file with the following values (see .env.example):
