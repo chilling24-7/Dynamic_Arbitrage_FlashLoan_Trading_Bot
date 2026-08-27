@@ -385,3 +385,4 @@ Be sure to check their documentation for latest updates regarding their contract
 
 - All tests should work, but some variables may need to be adjusted like threshold
 # Arbitrum_Single_Dex_Dynamic_Arbitrage_FlashLoan_Trading_Bot
+# Arbitrum_Single_Dex_FlashLoan_Trading_Bot
