@@ -1,24 +1,141 @@
 # Trading Bot Demo
 
 ## Description
-This bot is designed to be a Dynamic Arbitrage Flash Loan trading bot. This trading bot leverages an **arbitrage strategy** to detect and profit from price differences between two decentralized exchanges: **Uniswap** and **Sushiswap**. The bot continuously monitors swap events, calculates potential profits, and executes trades through a smart contract to take advantage of price discrepancies. The tokens it monitors is from the topTokens.js file, you can add tokens to it and make list bigger. This bot is designed to take out a **Flash Loan** from Balancer using WETH. This bot does have code in it do a 3 token arb, but due to problems, most of the code was taken out, some of it remains so if a 3 token ARB is desired, some changes can be done to make that happen. 
+
+This bot is designed as a Dynamic Arbitrage Flash Loan MEV trading system.
+
+It operates as a real-time, event-driven arbitrage engine that monitors **Uniswap V3 swap activity** and detects potential pricing inefficiencies between different liquidity pools on the **same decentralized exchange (DEX)**.
+
+The bot uses **one DEX (Uniswap V3)** and performs arbitrage by comparing prices and liquidity across multiple pools for the same WETH-based trading pair. It does not perform cross-DEX arbitrage.
+
+The bot continuously listens to on-chain swap events, evaluates trade conditions, estimates profitability, and executes arbitrage transactions via a smart contract when valid opportunities are detected.
+
+## Core Strategy
+
+- Primary data source: **Uniswap V3 Swap events**
+- DEX model: **Single-DEX arbitrage**
+- Primary DEX: **Uniswap V3**
+- Arbitrage model: **Multi-pool arbitrage within the same DEX**
+- Focus asset: **WETH-based liquidity pairs**
+- Strategy type: **Event-driven arbitrage / MEV-style execution**
+- Execution model: **Flash-loan based trading using WETH liquidity**
+
+The bot does not rely on static price polling alone. Instead, it reacts to live on-chain swap events and compares pricing across different Uniswap V3 pools for the same trading pair.
+
+The execution flow is:
+
+**Swap Event → Pool Filtering → Multi-Pool Analysis → Profit Check → Execution**
+
+For example, when a swap occurs in one WETH/LINK pool, the bot evaluates the other WETH/LINK pools on Uniswap V3 to determine whether a price discrepancy exists that can support a profitable arbitrage trade.
+
+The resulting arbitrage route may look like:
+
+**WETH → LINK (Pool A) → WETH (Pool B)**
+
+where Pool A and Pool B are different Uniswap V3 liquidity pools for the same token pair.
+
+## Architecture Notes
+
+- Built with **Ethers v6**
+- All token amounts and financial calculations use **BigInt precision**
+- Single-DEX architecture using **Uniswap V3**
+- Multi-pool arbitrage across different pools and fee tiers
+- Event-driven opportunity detection
+- Historical block-aware pool analysis
+- Exact quote validation before execution
+- Flash-loan based execution through the arbitrage smart contract
+
+## Historical Context
+
+The original version of this bot supported multi-DEX arbitrage (Uniswap + Sushiswap) and experimental 3-token routing logic.
+
+That architecture has since been simplified to improve reliability and reduce execution risk. Some legacy components for multi-hop or multi-DEX arbitrage may still exist in the codebase but are currently inactive.
+
+Future upgrades may reintroduce:
+- Multi-DEX price comparison
+- Cross-DEX arbitrage routing
+- Mempool-based backrunning strategies
 
 ### How It Works:
-1. The bot listens for **swap events** from both **Uniswap** and **Sushiswap**.
-2. When a swap event is detected, the bot checks the current prices on both exchanges.
-3. If the price difference meets the required threshold, the bot calculates potential profit and determines the best trading direction.
-4. The bot executes the arbitrage trade on the exchanges by leveraging a **flash loan**.
-5. It transfers any profit to the owner's wallet and continues monitoring for further opportunities.
+
+1. The bot listens to real-time **Uniswap V3 Swap events** using WebSocket (or polling in local mode).
+2. When a swap event is detected, it is decoded into a normalized trade signal (token in / token out / amount).
+3. The event passes through a filtering layer:
+   - WETH-based pair validation
+   - Minimum trade size checks
+   - Liquidity and safety constraints
+   - Duplicate transaction protection
+4. If the event passes initial filters, the bot runs a pricing and profitability analysis using on-chain quote data.
+5. The system evaluates whether a valid arbitrage opportunity exists based on expected output, fees, and spread.
+6. If the trade is profitable, the bot constructs an execution plan and submits a transaction via a flash-loan based smart contract.
+7. Executed trades are tracked, and successful profits are recorded before the bot resumes monitoring for new opportunities.
+
+---
 
 ### Purpose:
-This bot is designed to automate arbitrage trading, which involves buying an asset on one exchange at a lower price and selling it on another exchange at a higher price. The goal is to make a profit from the price difference without requiring any initial capital, using **flash loans** to facilitate trades.
+
+This bot is designed to automate **event-driven MEV-style arbitrage trading on Uniswap V3**.
+
+Instead of relying on static price polling, it reacts to live blockchain activity and analyzes swap events in real time to identify short-lived pricing inefficiencies between **different Uniswap V3 liquidity pools for the same trading pair**.
+
+The system uses a **single-DEX, multi-pool arbitrage strategy**. When an opportunity is detected, it can use **WETH-based flash-loan liquidity** to execute a capital-efficient trade without requiring upfront trading capital.
+
+A typical arbitrage route is:
+
+**WETH → Token (Pool A) → WETH (Pool B)**
+
+The system prioritizes:
+
+- Low-latency event response
+- Historical block-aware pool analysis
+- Multi-pool price and liquidity comparison
+- Strict profitability filtering
+- Exact Uniswap V3 quote validation
+- Gas-aware profit calculation
+- Transaction simulation before execution
+- Safe execution via deterministic smart contract logic
+- Modular architecture for future MEV enhancements
+
+The current strategy is intentionally focused on **single-DEX, multi-pool arbitrage**. Future extensions may include mempool-based detection, backrunning, and multi-DEX routing.
 
 ### Author's Notes:
-I learned how to make an Arbitrage Flash Loan Trading Bot. I then took it a step farther to do a Dynamic Arbitrage Flash Loan trading bot that will scan multiple tokens. The goal was to go from a 1 to 1 swap to 1 to Many strategy. This bot will do trades between the WETH token and any other token that is in the list. I spent alot of time getting this to work, it works fine on local host and I am currently Forking on Mainnet. So in theory, it should work if on live network. 
 
-As for why I am doing this, I took a class at DAPP Univeristy about being a Block Chain Developer and it gave me alot of knowledge on the Block Chain. It also mentioned about how to use or make an Arbitrage Flash Loan Trading Bot. I downloaded there Bot and tried to make it work, but had problems. It worked somewhat but needed alot of tweeking. 
+This project started as an implementation of a basic **flash loan arbitrage bot**, focused on detecting price differences between token pairs and executing trades through smart contracts.
 
-I then used AI (ChatGPT) at https://chatgpt.com/ to make changes and make it work on a Local Node or Local Block Chain on my computer. I wanted to go farther with the bot and make it a professional MEV bot, but it seems I need to go in steps to get more knowledge and understanding on how it works. I have learned that using AI, the possiblities are limitless if you put in the time and effort, but AI is flawed and I spend alot of time debugging or fixing what code it writes. 
+It has since evolved into a more advanced **event-driven arbitrage / MEV-style system** running on the **Arbitrum network**, specifically designed around **Uniswap V3 swap activity** and WETH-based liquidity routing.
+
+The current version of the bot focuses on:
+
+- Real-time **Uniswap V3 swap event monitoring on Arbitrum**
+- **Single-DEX, multi-pool arbitrage** across different Uniswap V3 pools and fee tiers
+- WETH-centered token routing and flash-loan execution
+- Dynamic token universe defined in `topTokens.js`
+- Historical block-aware pool analysis using the event block
+- Pool liquidity and tradeability filtering
+- Spot-price spread analysis across candidate pools
+- Profit validation using **exact on-chain Uniswap V3 Quoter results**
+- Gas-aware profitability analysis
+- Transaction simulation before execution
+- Flash-loan based execution through a smart contract
+
+The original goal was a simple 1-to-1 arbitrage model, but the system has since evolved into a dynamic, event-driven **single-DEX, multi-pool arbitrage pipeline** that evaluates opportunities as they appear on-chain and validates potential routes before execution. While doing trades between Dex's is possible and more profitable, this method can be done and can be profitable as well. 
+
+---
+
+This project was originally inspired by educational material from a blockchain development course (DApp University). The initial implementation provided a basic foundation for understanding arbitrage, flash loans, and smart contract interaction, but required significant refinement and restructuring to become functional in a real-world environment.
+
+A large portion of the development process involved iterative debugging, architectural redesign, and performance improvements. AI-assisted development tools (including ChatGPT at https://chatgpt.com/) were used to accelerate development and explore different implementation approaches.
+
+However, the process also highlighted an important reality: while AI can significantly speed up development, it still requires strong technical understanding to debug, validate, and structure systems correctly.
+
+---
+
+From a broader perspective, this project is part of a personal learning journey into decentralized finance, smart contract systems, and automated trading strategies. The goal is to understand how MEV-style systems work at a deeper level and progressively evolve the bot into a more advanced trading engine over time.
+
+The intent behind sharing this project is educational:
+to demonstrate how arbitrage systems and flash loan-based strategies can be built, studied, and iterated on within a decentralized environment like Arbitrum.
+
+Ultimately, this project reflects an exploration of financial systems, open-source tooling, and decentralized infrastructure, and how these technologies can be used to build automated market strategies.
 
 With the way the world is going, I wanted to share what I did and show what I have learned and maybe inspire of help other developers get out of the current financial system or find other ways to support themselves. I want to let everyone who wants to trade crypto using flash loans have that opportunity or at least know where to start and show that it can be done. The way I see it, we are all in this world together and we need to help each other and give people ideas or ways to get by in this world since there are alot of people trying to take away peoples freedoms and rights. This is one way to fight back.
 

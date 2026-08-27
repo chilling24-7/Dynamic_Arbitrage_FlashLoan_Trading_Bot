@@ -1,18 +1,77 @@
 /**
+ /*
  * ────────────────────────────────────────────────────────────────────────────────
- * Arbitrage Bot for Uniswap and Sushiswap
+ * Event-Driven Uniswap V3 Execution Bot (MEV-Style Route Engine)
  * ────────────────────────────────────────────────────────────────────────────────
  *
- * Features:
- * - Monitors price differences between two tokens (e.g., WETH/SHIB) on Uniswap and Sushiswap
- * - Determines arbitrage direction and profitability
- * - Executes 2-token arbitrage (supports 3-token in future)
- * - Handles dummy token for 2-token trades
- * - Includes cooldown and safety mechanisms
+ * Overview:
+ * - Monitors live Uniswap V3 Swap events across selected WETH-based pools
+ * - Uses a curated token universe to build a full pool registry:
+ *   tokenA_tokenB → multiple fee-tier pools (500 / 3000 / 10000)
+ * - Reacts to swap events by analyzing local liquidity topology around WETH
+ * - Builds a dynamic token graph from the pool registry
+ * - Finds optimal execution paths using multi-hop route simulation
+ * - Selects best-performing route across:
+ *     • direct single-hop swaps
+ *     • multi-hop circular routes (graph-based arbitrage loops)
+ *
+ * Architecture:
+ * - Pool Registry (authoritative source of all token pair liquidity + fee tiers)
+ * - Graph Builder (derived topology from registry, used for path discovery)
+ * - Edge Resolver (selects best pool per token pair using quoter simulation)
+ * - Path Simulator (evaluates full routes using sequential swap simulation)
+ * - Profit Engine (compares direct vs multi-hop opportunities)
+ * - Execution Layer (flash-loan based trade execution using enriched routes)
+ *
+ * Strategy Type:
+ * - Single-DEX MEV execution (Uniswap V3)
+ * - Latency-sensitive reaction system (event-driven, not mempool scanning)
+ * - WETH-centric anchor trading model
+ * - Hybrid strategy:
+ *     ✔ direct edge exploitation (single pool inefficiencies)
+ *     ✔ graph arbitrage (multi-token cyclic routing)
+ *
+ * Key Features:
+ * - BigInt-based math for all execution, routing, and profit calculations
+ * - Ethers v6 compatible architecture
+ * - Multi-fee-tier pool awareness per token pair
+ * - Dynamic best-pool selection via quoter-based evaluation
+ * - Edge caching for route simulation efficiency
+ * - Duplicate transaction protection and execution locks
+ *
+ * Routing Logic:
+ * - Build token graph from poolRegistry connections
+ * - Generate valid cyclic and multi-hop paths from WETH anchor
+ * - Simulate each path using best available pool per edge
+ * - Compare all results and select highest profit route
+ * - Enrich final route with execution-ready hop instructions:
+ *     { tokenIn, tokenOut, pool, fee }
+ *
+ * Execution Flow:
+ * 1. Swap event detected
+ * 2. Local pool registry lookup for affected token pair
+ * 3. Graph expansion from WETH neighborhood
+ * 4. Path generation (cycle detection up to max hop depth)
+ * 5. Edge-by-edge simulation using best available pools
+ * 6. Compare direct vs multi-hop profit outcomes
+ * 7. Build execution-grade routePlan (fully resolved swaps)
+ * 8. Execute via flash-loan contract if profitable
  *
  * Notes:
- * - Fully BigInt compatible
- * - Compatible with Ethers v6
+ * - This system no longer assumes a single best pool per pair
+ * - Execution depends on dynamically selected pool per hop
+ * - Path output is no longer just token arrays but execution-ready routes
+ * - System prioritizes route correctness over theoretical price discovery
+ *
+ * Important Distinction:
+ *
+ * ✔ multi-path routing + dynamic pool selection + execution-grade simulation
+ *
+ * NOT:
+ *
+ * ❌ static fee-tier switching on a single pair
+ * ❌ naive two-hop arbitrage only
+ * ❌ price-only comparison without route construction
  */
 
 require("./helpers/server");
@@ -25,19 +84,8 @@ const config = require("./config.json");
 // Now destructure after the config is loaded
 const { PROJECT_SETTINGS } = config;
 
-const {
-  determineNetwork,
-  getSigner,
-  getOrCreatePairContract,
-  evaluateLiquidity,
-  getReserves,
-  getWethReserve,
-  estimateMaxProfit,
-  getFlashLoanSize,
-} = require("./helpers/helpers");
-
-const { provider, uFactory, sFactory, uRouter, sRouter, arbitrage } =
-  require("./helpers/initialization");
+const {getFlashLoanSize, generateLoanSizes, validatePool, checkPoolTradeability, formatCompactBigInt, minSpread} = require("./helpers/helpers");
+const initialization = require("./helpers/initialization");
 
 const topTokens = require("./helpers/topTokens");
 const REQUIRE_MEMPOOL_MATCH = true;
@@ -46,6 +94,8 @@ let isResetting = false;
 
 // Simulate orange color
 const orange = chalk.rgb(255, 140, 0);
+const RESET = "\x1b[0m";
+const ORANGE = "\x1b[38;5;208m";
 
 // ENV
 const arbFor = process.env.ARB_FOR;       // e.g., WETH
@@ -65,1680 +115,1877 @@ const ERC20_ABI = [
 // MAIN
 // ─────────────────────────────────────────
 async function main() {
-  // ============================================================
-  // 1️⃣ ENVIRONMENT
-  // ============================================================
   const isLocal = PROJECT_SETTINGS.isLocal;
-  console.log(`Running in ${isLocal ? "LOCAL FORK" : "LIVE MAINNET"} mode`);
+  const networkType = isLocal ? "LOCAL" : "ARBITRUM";
 
-  // ============================================================
-  // 2️⃣ PROVIDERS
-  // ============================================================
-  let executionProvider;
-  let monitoringProvider;
+  const { ethers } = require("ethers");
 
-  if (isLocal) {
-    executionProvider = new ethers.JsonRpcProvider(
-      process.env.LOCAL_RPC_URL || "http://127.0.0.1:8545"
-    );
-    monitoringProvider = executionProvider;
-  } else {
-    executionProvider = new ethers.JsonRpcProvider(
-      `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
-    );
+  const executionProvider = new ethers.JsonRpcProvider(
+    isLocal
+      ? (process.env.LOCAL_RPC_URL || "http://127.0.0.1:8545")
+      : `https://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+  );
 
-    monitoringProvider = new ethers.WebSocketProvider(
-      `wss://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
-    );
+  const monitoringProvider = isLocal
+    ? executionProvider: new ethers.WebSocketProvider(
+        `wss://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+      );
 
-    monitoringProvider.on("error", (err) => {
-      console.error("WebSocket Error:", err);
-    });
+  process.on("SIGINT", () => { console.log("\n\n🛑 Shutting down monitor..."); monitoringProvider.destroy(); process.exit(0); });
+
+  async function processSwapQueue(ctx) {
+
+      const refs = ctx.refs;
+
+      if (refs._isProcessingSwapQueue)
+          return;
+
+      refs._isProcessingSwapQueue = true;
+
+      try {
+
+          while (refs._swapQueue) {
+              // grab current event
+              const params = refs._swapQueue;
+
+              // clear slot immediately
+              refs._swapQueue = null;
+
+              await swapEvent(ctx, params);
+              // if another event arrived while swapEvent ran,  loop once more and process only the newest one
+          }
+
+      } catch (e) {
+          console.log("❌ swap queue error:", e.message);
+
+      } finally {
+          refs._isProcessingSwapQueue = false;
+
+      }
   }
 
-  // ============================================================
-  // 3️⃣ MONITORING UI STATE
-  // ============================================================
-  let monitoringInterval;
+  initialization.initContracts(executionProvider);
+  await initialization.init();
+
+  monitoringProvider.on("error", e => {
+    console.log("Websocket error:", e.message);
+  });
+
+  const signer = new ethers.Wallet(
+    process.env.PRIVATE_KEY,
+    executionProvider
+  );
+
+  const attachedPools = new Set();
+  const startBlock = await executionProvider.getBlockNumber();
+
   let monitoringPaused = false;
   let dots = 0;
+  const seenEvents = new Map();
 
   const startMonitoring = () => {
-    if (monitoringInterval) return;
-
-    monitoringInterval = setInterval(() => {
+    setInterval(() => {
       if (!monitoringPaused) {
         dots = (dots + 1) % 7;
         process.stdout.write(`\r⏳ Monitoring${".".repeat(dots)}   `);
       }
-    }, 500);
+    },500);
   };
 
+  const readline = require("readline");
   const pauseMonitoring = () => {
     monitoringPaused = true;
-    process.stdout.write("\r                     \r");
+
+    readline.clearLine(process.stdout, 0);
+    readline.cursorTo(process.stdout, 0);
   };
 
-  const resumeMonitoring = () => {
-    monitoringPaused = false;
-    if (!monitoringInterval) startMonitoring();
+  const resumeMonitoring = () => monitoringPaused = false;
+  const addr = a => a.toLowerCase();
+
+  const WETH = addr(process.env.WETH);
+  const USDC = addr(process.env.USDC);
+  const BASE_ASSETS = new Set(topTokens.map(t => addr(t.address)));
+  const V3_FEES = [100,500,3000,10000];
+
+  const makePairKey = (a,b) => [addr(a),addr(b)].sort().join("_");
+
+  globalThis.makePairKey = makePairKey;
+
+  // fresh registry
+  const poolRegistry = new Map();
+  globalThis.poolRegistry = poolRegistry;
+
+  const getPool = async (a, b, fee) => {
+    try {
+      const pool = await initialization.uniV3Factory.getPool(a, b, fee);
+      if (!pool || pool === ethers.ZeroAddress) return null;
+
+      return pool.toLowerCase();
+    } catch {
+      return null;
+    }
   };
 
-  // ============================================================
-  // 4️⃣ NETWORK DETECTION
-  // ============================================================
-  const { type, startBlock } = await determineNetwork(
-    executionProvider,
-    null,
-    isLocal
-  );
+  const registerPoolsForPair = async (tokenA, tokenB) => {
+    const norm = (a) => a.toLowerCase();
 
-  console.log(`Network type: ${type}`);
-  const networkType = type;
+    const a = norm(tokenA.address);
+    const b = norm(tokenB.address);
 
-  // ============================================================
-  // 5️⃣ SIGNER + FLASH LOAN SIZE
-  // ============================================================
-  const signer = await getSigner(type, executionProvider);
-  const FLASH_LOAN_SIZE = getFlashLoanSize(type);
+    //if(a !== WETH && b !== WETH) return;
+    if (!BASE_ASSETS.has(a) && !BASE_ASSETS.has(b)) {return;}
 
-  // ============================================================
-  // 6️⃣ LOAD TOKENS
-  // ============================================================
-  let loadedTokens = 0;
+    // ✅ canonical key (always sorted)
+    const key = makePairKey(a, b);
+
+    const pools = [];
+
+    for (const fee of V3_FEES) {
+      try {
+        // IMPORTANT: always pass normalized addresses
+        const pool = await getPool(tokenA.address, tokenB.address, fee);
+
+        if (!pool) continue;
+        const info = await validatePool(pool, executionProvider);
+
+        if(!info)
+          continue;
+
+        pools.push({
+          address:pool.toLowerCase(),
+          fee,
+          liquidity:info.liquidity,
+          sqrtPriceX96:info.sqrtPriceX96
+        });
+
+      } catch (e) {
+        // silent fail is fine for discovery phase
+        continue;
+      }
+    }
+
+    if (pools.length === 0) return;
+
+      poolRegistry.set(key, {tokenA: a, tokenB: b, pools});
+    };
+
+  let loadedTokens=0;
+
   for (const token of topTokens) {
     try {
-      token.address = ethers.getAddress(token.address.toLowerCase());
-      token.contract = new ethers.Contract(
-        token.address,
-        ERC20_ABI,
-        executionProvider
-      );
+      const tokenAddr = addr(token.address);
 
-      const code = await executionProvider.getCode(token.address);
+      const code = await executionProvider.getCode(tokenAddr);
+      if (code === "0x") continue;
 
-      if (code !== "0x") {
-        try {
-          token.decimals = BigInt(await token.contract.decimals());
-        } catch {
-          token.decimals = 18n;
-        }
+      const contract = new ethers.Contract(tokenAddr, ERC20_ABI, executionProvider);
 
-        try {
-          token.symbol = await token.contract.symbol();
-        } catch {}
-      }
+      // decimals (safe fallback)
+      let decimals = 18;
+      try {
+        decimals = Number(await contract.decimals());
+      } catch {}
+
+      // symbol (optional)
+      let symbol;
+      try {
+        symbol = await contract.symbol();
+      } catch {}
+
+      // apply normalized / finalized token object
+      token.address = tokenAddr;
+      token.contract = contract;
+      token.decimals = decimals;
+      token.symbol = symbol;
 
       loadedTokens++;
-    } catch (err) {
-      console.error(`Error loading token ${token.symbol}:`, err);
+
+    } catch {
+      // ignore bad tokens entirely
+      continue;
     }
   }
 
-  console.log(`✅ Loaded ${loadedTokens} tokens`);
+  console.log(`✅ Loading ${loadedTokens} tokens`);
 
-  const usdcToken = {
-    address: process.env.USDC,
-    symbol: "USDC",
-    decimals: 6n
+  if (!topTokens.some(t => t.address === WETH)) throw new Error("WETH missing");
+
+  const ctx = {
+
+    isLocal,
+    networkType,
+
+    executionProvider,
+    monitoringProvider,
+
+    signer,
+    getFlashLoanSize,
+
+    refs:{
+      _swapQueue: null,
+      _isProcessingSwapQueue:false,
+      processingEvent:false,
+      goodTradesCounter:0,
+      lastSubmittedTxHash:null,
+      isGlobalExecuting:false
+    },
+
+    addr,
+
+    analyze,
+    checkProfit,
+    executeTrade,
+    minProfit: ethers.parseUnits("0.01", 18),
+
+    poolRegistry,
+    makePairKey,
+
+    arbitrageContract: initialization.arbitrage,
+    topTokens,
+
+    quoter: initialization.uniV3Quoter,
+    factory: initialization.uniV3Factory,
+
+    ui:{
+      pauseMonitoring,
+      resumeMonitoring
+    }
   };
 
+  async function loadInitialPools(){
+    const pairs=[];
+
+    for(let i=0;i<topTokens.length;i++){
+      for(let j=i+1;j<topTokens.length;j++){
+
+        if(topTokens[i].address===topTokens[j].address)
+          continue;
+
+        pairs.push([topTokens[i],topTokens[j]]);
+      }
+    }
+
+    let found=0;
+    for(const [a,b] of pairs){
+      const before=poolRegistry.size;
+      await registerPoolsForPair(a,b);
+
+      if(poolRegistry.size>before)
+        found++;
+    }
+
+    let totalPools=0;
+    for(const [,v] of poolRegistry){
+      totalPools += v.pools.length;
+    }
+
+    console.log(`
+  ──────── POOL REGISTRY ────────
+  Pairs checked : ${pairs.length}
+  Pairs found   : ${found}
+  Pools tracked : ${totalPools}
+  ───────────────────────────────
+  `);
+  }
+  await loadInitialPools();
+
+  const IUniswapV3Pool =require("@uniswap/v3-core/artifacts/contracts/UniswapV3Pool.sol/UniswapV3Pool.json");
+  const poolInterface = new ethers.Interface(IUniswapV3Pool.abi);
+
+  const poolAddresses = [];
+
+  for (const entry of poolRegistry.values()) {
+      for (const p of entry.pools) {
+          poolAddresses.push(p.address);
+      }
+  }
+
+  const SWAP_TOPIC = ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24)");
+  const filter = {address: poolAddresses, topics: [SWAP_TOPIC]};
+
+  monitoringProvider.on(filter, async (log) => {
+
+    const txHash = log.transactionHash;
+    const logIndex = log.index;
+
+    if (txHash == null || logIndex == null)
+        return;
+
+    const eventKey = `${txHash}-${logIndex}`;
+
+    if (seenEvents.has(eventKey))
+        return;
+
+    seenEvents.set(eventKey, Date.now());
+    const parsed = poolInterface.parseLog(log);
+
+    if (!parsed)
+        return;
+
+    const event = {...log, args: parsed.args, fragment: parsed.fragment, name: parsed.name, signature: parsed.signature};
+    ctx.refs._swapQueue = {event, startBlock};
+
+    processSwapQueue(ctx);
+  });
+  console.log(`👀 Watching ${poolAddresses.length} pools`);
+  startMonitoring();
+}
+
+// ──────────────────────────────────────
+// SWAP EVENT (REFACTORED PROPERLY)
+// ─────────────────────────────────────────
+async function swapEvent(ctx, params) {
+  const { event, startBlock } = params;
+
+  const { 
+      refs, 
+      analyze, 
+      checkProfit, 
+      executeTrade, 
+      ui 
+  } = ctx;
+
+  const poolRegistry = ctx.poolRegistry;
+
+  const { pauseMonitoring, resumeMonitoring } = ui || {};
+
+
   // ============================================================
-  // 7️⃣ PAIR DISCOVERY (WITH CACHING AND LAST-PROCESSED BLOCKS)
+  // EXECUTION LOCK
   // ============================================================
-  
-  const discoveredPairsMap = new Map();
-  const pairLiquidity = {};
-  const reserveCache = new Map();          // cache reserves
-  const routingCache = new Map();          // cache routing score
-  const lastProcessedBlockPerPair = new Map(); // track last processed block
 
-  const WETH = ethers.getAddress(process.env.WETH.toLowerCase());
-  const USDC = ethers.getAddress(process.env.USDC.toLowerCase());
-  const DAI  = ethers.getAddress(process.env.DAI.toLowerCase());
-  const USDT = ethers.getAddress(process.env.USDT.toLowerCase());
+  if (refs.isGlobalExecuting) {
+      console.log("⏳ Swap already processing, ignoring event");
+      return;
+  }
 
-  let bridgeFull = 0, bridgePartial = 0, bridgeMinimal = 0, bridgeNone = 0;
+  refs.isGlobalExecuting = true;
 
-  const wethToken = topTokens.find(t => t.address.toLowerCase() === WETH.toLowerCase());
-  if (!wethToken) throw new Error("❌ WETH not found in topTokens");
 
-  // -----------------------------
-  // 🔹 Refresh / Update Function (optimized)
-  // -----------------------------
-  const refreshPairs = async () => {
-    bridgeFull = bridgePartial = bridgeMinimal = bridgeNone = 0; // reset bridge counters
-    const now = Date.now();
+  try {
 
-    // Get all WETH pairs to refresh (existing discovered + new undiscovered)
-    const wethPairsToUpdate = topTokens
-      .filter(t => t.address.toLowerCase() !== WETH.toLowerCase())
-      .map(token => ({ tokenA: token, tokenB: wethToken }));
 
-    // Refresh each WETH pair
-    await Promise.all(wethPairsToUpdate.map(async ({ tokenA, tokenB }) => {
-      const pairKey = [tokenA.address, tokenB.address].sort().join("_");
-      const existingPair = discoveredPairsMap.get(pairKey);
+      // ============================================================
+      // VALIDATE POOL REGISTRY
+      // ============================================================
+
+      if (!(poolRegistry instanceof Map)) {
+          console.error("❌ poolRegistry invalid at swapEvent level");
+          console.log(poolRegistry);
+          return;
+      }
+
+
+      // ============================================================
+      // EVENT VALIDATION
+      // ============================================================
+
+      const log = event?.log ?? event;
+      if (!log) return;
+
+      const { transactionHash: txHash, blockNumber, address } = log;
+
+      if (!txHash || !blockNumber || !address) return;
+
+
+      if (
+          refs.lastSubmittedTxHash &&
+          txHash.toLowerCase() === refs.lastSubmittedTxHash
+      ) {
+          return;
+      }
+
+
+      // ============================================================
+      // INIT STATE
+      // ============================================================
+
+      refs._seenTx ??= new Set();
+
+      if (refs._seenTx.has(txHash)) return;
+      refs._seenTx.add(txHash);
+
+
+      if (address === "0xE592427A0AEce92De3Edee1F18E0157C05861564") {
+          return;
+      }
+
+
+      // ============================================================
+      // ANALYZE
+      // ============================================================
+
+      pauseMonitoring?.();
+
+      let analysis;
+
+      try { analysis = await analyze(ctx, {event: log, startBlock, refs}); } catch(e) { console.log("❌ analyze error:", e.message); return; }
+
+      if (!analysis?.pass || !analysis?.tradeCandidate) return;
+
+
+      // ============================================================
+      // CHECK PROFIT
+      // ============================================================
+
+      let profit;
+      try { profit = await checkProfit(ctx, {tradeCandidate: analysis.tradeCandidate, eventBlock: event.blockNumber}); }
+      catch (e) { console.log("❌ checkProfit failed:", e.message); return; }
+
+      if (!profit?.profitable) return;
+
+      // ============================================================
+      // EXECUTE TRADE
+      // ============================================================
 
       try {
-        const uPair = await getOrCreatePairContract(uFactory, tokenA.address, tokenB.address, monitoringProvider);
-        const sPair = await getOrCreatePairContract(sFactory, tokenA.address, tokenB.address, monitoringProvider);
-        if (!uPair && !sPair) return; // no pair exists
 
-        // canonical token order
-        const chainToken0 = uPair ? await uPair.token0() : await sPair.token0();
-        let actualToken0 = tokenA, actualToken1 = tokenB;
-        if (chainToken0.toLowerCase() === tokenB.address.toLowerCase()) {
-          [actualToken0, actualToken1] = [tokenB, tokenA];
-        }
+          await executeTrade(ctx, {
+              tokenIn: profit.tokenIn,
+              flashAmount: profit.flashAmount,
+              executionRoute: profit.executionRoute,
+              netProfit: profit.netProfit,
+              flashToken: profit.flashToken,
+              expectedUsdc: profit.expectedUsdc
+          });
 
-        const uniExists = !!uPair;
-        const sushiExists = !!sPair;
-        const isOneSided = uniExists !== sushiExists;
-        const isDirect = uniExists && sushiExists;
+      } catch (err) {
+          console.error("❌ executeTrade failed:", err.message);
+      }
 
-        // -----------------------------
-        // Reserves / Liquidity
-        let cachedReserves = reserveCache.get(pairKey);
-        if (!cachedReserves || now - cachedReserves.lastUpdated > 5000) {
-          const uRes = uPair ? await getReserves(uFactory, actualToken0, actualToken1, monitoringProvider) : cachedReserves?.uReserves ?? null;
-          const sRes = sPair ? await getReserves(sFactory, actualToken0, actualToken1, monitoringProvider) : cachedReserves?.sReserves ?? null;
-          cachedReserves = { uReserves: uRes, sReserves: sRes, lastUpdated: now };
-          reserveCache.set(pairKey, cachedReserves);
-        }
+  } finally {
 
-        const { uReserves, sReserves } = cachedReserves;
-        const minTradeSize = 10n ** 16n;
-        const minTokenReserve = 10n ** BigInt(actualToken0.decimals);
+      resumeMonitoring?.();
+      refs.isGlobalExecuting = false;
+  }
+}
 
-        const uLiquidityValid = uReserves
-          ? evaluateLiquidity({ reserveBase: BigInt(uReserves.reserveA), minTradeSize, minTokenReserve, dexName: `Uniswap ${actualToken0.symbol}/${actualToken1.symbol}` }).valid
-          : false;
-        const sLiquidityValid = sReserves
-          ? evaluateLiquidity({ reserveBase: BigInt(sReserves.reserveA), minTradeSize, minTokenReserve, dexName: `Sushi ${actualToken0.symbol}/${actualToken1.symbol}` }).valid
-          : false;
+// ─────────────────────────────────────────────
+// Analyze will be a hard gate based on the Event Seen
+// ─────────────────────────────────────────────
+async function analyze(ctx, params) {
+  
+  // =====================================================
+  // 1. Context & Event Validation
+  // =====================================================
 
-        const canTrade = (uniExists && sushiExists) ? uLiquidityValid && sLiquidityValid : uLiquidityValid || sLiquidityValid;
-        pairLiquidity[pairKey] = canTrade ? "OK" : "LOW";
+  const {event, startBlock} = params;
 
-        // -----------------------------
-        // 🌉 Bridge coverage for one-sided WETH pairs
-        // -----------------------------
-        let bridgeCount = 0;
-        let hasUSDC = false, hasDAI = false, hasUSDT = false;
+  const {
+      addr,
+      executionProvider: provider,
+      quoter,
+      factory,
+      signer,
+      arbitrageContract,
+      minProfit,
+      topTokens,
+      tokenRegistry,
+      poolRegistry,
+      refs
+  } = ctx;
 
-        // Only check bridge tokens if the pair is one-sided
-        if (isOneSided) {
-          const nonWETHToken = actualToken0.address.toLowerCase() === WETH.toLowerCase() ? actualToken1 : actualToken0;
+  const POOL_ABI=[
+  "function token0() view returns(address)", "function token1() view returns(address)", "function fee() view returns(uint24)",
+  "function liquidity() view returns(uint128)", "function slot0() view returns(uint160 sqrtPriceX96,int24 tick,uint16,uint16,uint16,uint8,bool)"
+  ];
 
-          const uPairUSDC = await getOrCreatePairContract(uFactory, nonWETHToken.address, USDC, monitoringProvider);
-          const sPairUSDC = await getOrCreatePairContract(sFactory, nonWETHToken.address, USDC, monitoringProvider);
-          const uPairDAI  = await getOrCreatePairContract(uFactory, nonWETHToken.address, DAI, monitoringProvider);
-          const sPairDAI  = await getOrCreatePairContract(sFactory, nonWETHToken.address, DAI, monitoringProvider);
-          const uPairUSDT = await getOrCreatePairContract(uFactory, nonWETHToken.address, USDT, monitoringProvider);
-          const sPairUSDT = await getOrCreatePairContract(sFactory, nonWETHToken.address, USDT, monitoringProvider);
+  const COL = {rank: 6, fee: 9, liquidity: 25, quality: 20, test: 15, price: 16, spread: 11, event: 7};
+  const stripAnsi = (str) => String(str).replace(/\x1B\[[0-9;]*m/g, "");
 
-          hasUSDC = !!uPairUSDC || !!sPairUSDC;
-          hasDAI  = !!uPairDAI  || !!sPairDAI;
-          hasUSDT = !!uPairUSDT || !!sPairUSDT;
+  const col = (value, width) => {
+    const text = String(value);
+    const visibleLength = stripAnsi(text).length;
 
-          bridgeCount = (hasUSDC ? 1 : 0) + (hasDAI ? 1 : 0) + (hasUSDT ? 1 : 0);
-        }
+    return text + " ".repeat(Math.max(0, width - visibleLength));
+  };
 
-        // Update global bridge counters
-        if (bridgeCount === 3) bridgeFull++;
-        else if (bridgeCount === 2) bridgePartial++;
-        else if (bridgeCount === 1) bridgeMinimal++;
-        else if (isOneSided) bridgeNone++;
+  // =====================================================
+  // Math Constants
+  // =====================================================
 
-        // -----------------------------
-        // 🧠 ROUTING SCORE UPDATE (ENHANCED BUT SAFE)
-        // -----------------------------
+  const SCALE = 10n ** 18n;
+  const Q192 = 2n ** 192n;
+  const REQUIRED_GROSS_SPREAD = 0.05;
+  const MIN_ROUND_TRIP_PROFIT = 0.00;
 
-        let routingScore = 0;
+  const registry = poolRegistry;
 
-        // -----------------------------
-        // 🚨 HARD ELIGIBILITY GATE (UNCHANGED BEHAVIOR)
-        // -----------------------------
-        const isEligible =
-          canTrade &&
-          (!isOneSided || bridgeCount > 0);
+  if (!registry) { console.log("❌ poolRegistry missing"); return { pass: false }; }
 
-        if (!isEligible) {
-          routingScore = 0;
-          pairLiquidity[pairKey] = "LOW";
-        } else {
+  const log = event?.log || event;
+  if (!log) return { pass: false };
 
-          // -----------------------------
-          // base liquidity signal
-          // -----------------------------
-          let liquidityScore = canTrade ? 20 : 0;
+  const { blockNumber: eventBlock, args } = log;
 
-          if (isOneSided) {
-            liquidityScore = Math.floor(liquidityScore * 0.5);
-          }
+  if (!eventBlock || eventBlock <= startBlock) return { pass: false };
+  if (!args) return { pass: false };
 
-          // -----------------------------
-          // dex coverage signal
-          // -----------------------------
-          let coverageScore = 0;
+  const amount0 = BigInt(args[2]);
+  const amount1 = BigInt(args[3]);
 
-          if (uniExists && sushiExists) coverageScore = 15;
-          else if (uniExists || sushiExists) coverageScore = 7;
+  const poolAddress = log.address.toLowerCase();
+  const norm = address => address.toLowerCase();
 
-          // -----------------------------
-          // bridge signal
-          // -----------------------------
-          const bridgeScore = isOneSided
-            ? Math.min(bridgeCount, 3)
-            : 6;
+  // =====================================================
+  // 2. Load Event Pool Information
+  // =====================================================
 
-          // =====================================================
-          // 🔥 NEW ADDITIONS (SAFE NON-BREAKING ENHANCEMENTS)
-          // =====================================================
+  let token0, token1, fee;
+  let bestTrade = null;
+  let totalRoutesChecked = 0;
 
-          // -----------------------------
-          // 1. Liquidity depth quality
-          // -----------------------------
-          const sharedLiquidity = canTrade
-            ? (uReserves?.reserve0 && sReserves?.reserve0
-                ? (BigInt(
-                    uReserves.reserve0 < uReserves.reserve1
-                      ? uReserves.reserve0
-                      : uReserves.reserve1
-                  ) <
-                  BigInt(
-                    sReserves.reserve0 < sReserves.reserve1
-                      ? sReserves.reserve0
-                      : sReserves.reserve1
-                  )
-                    ? BigInt(
-                        uReserves.reserve0 < uReserves.reserve1
-                          ? uReserves.reserve0
-                          : uReserves.reserve1
-                      )
-                    : BigInt(
-                        sReserves.reserve0 < sReserves.reserve1
-                          ? sReserves.reserve0
-                          : sReserves.reserve1
-                      ))
-                : 0n)
-            : 0n;
+  try {
+    const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
 
-          const depthScore = canTrade
-            ? Math.min(15, Number(sharedLiquidity / 10n ** 16n))
-            : 0;
+    [token0, token1, fee] = await Promise.all([
+      pool.token0({ blockTag: eventBlock }),
+      pool.token1({ blockTag: eventBlock }),
+      pool.fee({ blockTag: eventBlock })
+    ]);
+  } catch (e) {
+    console.log("SECTION 2 ERROR", { poolAddress, eventBlock, error: e.message });
+    return { pass: false };
+  }
 
-          // -----------------------------
-          // 2. Reserve balance quality
-          // -----------------------------
-          let balanceScore = 0;
+  token0 = norm(token0);
+  token1 = norm(token1);
+  fee = Number(fee);
 
-          if (uReserves && sReserves) {
-            const uMin =
-              uReserves.reserve0 < uReserves.reserve1
-                ? uReserves.reserve0
-                : uReserves.reserve1;
+  const t0 = topTokens.find(t => norm(t.address) === token0);
+  const t1 = topTokens.find(t => norm(t.address) === token1);
 
-            const uMax =
-              uReserves.reserve0 > uReserves.reserve1
-                ? uReserves.reserve0
-                : uReserves.reserve1;
+  if (!t0 || !t1) {
+    console.log("SECTION 2 TOKEN FAIL", { token0, token1 });
+    return { pass: false };
+  }
 
-            const sMin =
-              sReserves.reserve0 < sReserves.reserve1
-                ? sReserves.reserve0
-                : sReserves.reserve1;
+  // =====================================================
+  // 3. Resolve Trade Direction
+  // =====================================================
 
-            const sMax =
-              sReserves.reserve0 > sReserves.reserve1
-                ? sReserves.reserve0
-                : sReserves.reserve1;
+  let inputToken, outputToken, amountIn;
 
-            const uRatio = uMax > 0n ? Number((uMin * 100n) / uMax) : 0;
-            const sRatio = sMax > 0n ? Number((sMin * 100n) / sMax) : 0;
+  if (amount0 > 0n) {
+    inputToken = t0;
+    outputToken = t1;
+    amountIn = amount0;
+  } else if (amount1 > 0n) {
+    inputToken = t1;
+    outputToken = t0;
+    amountIn = amount1;
+  } else {
+    return { pass: false };
+  }
 
-            balanceScore = Math.floor((uRatio + sRatio) / 8);
-          }
+  const WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+  const isWeth = inputToken.address.toLowerCase() === WETH || outputToken.address.toLowerCase() === WETH;
 
-          // -----------------------------
-          // 3. Stability bonus
-          // -----------------------------
-          let stableLike = 0;
+  if (!isWeth) return { pass: false };
 
-          if (hasUSDC && hasUSDT && hasDAI) stableLike = 10;
-          else if (hasUSDC || hasUSDT || hasDAI) stableLike = 5;
+  const canonicalKey = makePairKey(token0, token1);
+  const entry = registry.get(canonicalKey);
+  const registryPools = Array.isArray(entry) ? entry : Array.isArray(entry?.pools) ? entry.pools : [];
+  const uniquePools = registryPools.length ? [...registryPools] : [];
 
-          // -----------------------------
-          // RAW SCORE (NO ARTIFICIAL NORMALIZATION YET)
-          // -----------------------------
-          const rawScore =
-            liquidityScore +
-            coverageScore +
-            bridgeScore +
-            depthScore +
-            balanceScore +
-            stableLike;
+  if (!uniquePools.length) return { pass: false };
 
-          // -----------------------------
-          // FINAL NORMALIZATION (FIXED SCALE)
-          // -----------------------------
 
-          // instead of compressing everything, we clamp only
-          routingScore = Math.min(30, Math.floor(rawScore * 0.5));
-        }
+  // =====================================================
+  // 4. SWAP EVENT 
+  // =====================================================
 
-        // -----------------------------
-        // Update discoveredPairs
-        const pairObj = {
-            pairName: `${actualToken0.symbol}/${actualToken1.symbol}`,
-            token0: actualToken0,
-            token1: actualToken1,
-            uPair,
-            sPair,
-            uniExists,
-            sushiExists,
-            isOneSided,
-            isDirect,
-            hasUSDC,
-            hasDAI,
-            hasUSDT,
-            bridgeCount,
-            routingScore,
-            liquiditySnapshot: {
-                canTrade,
-                uLiquidityValid,
-                sLiquidityValid,
-                uReserve: uReserves?.reserveA ?? null,
-                sReserve: sReserves?.reserveA ?? null
-            }
-        };
+  const latestBlock = await provider.getBlockNumber();
+  const amountOut = amount0 > 0n ? -amount1 : -amount0;
+  const direction = `${inputToken.symbol} → ${outputToken.symbol}`;
+  const action = outputToken.address.toLowerCase() === WETH ? `BUY ${outputToken.symbol}` : `SELL ${inputToken.symbol}`;
 
-        
-        if (!existingPair) {
-          discoveredPairsMap.set(pairKey, pairObj);
-        } else {
-          Object.assign(existingPair, pairObj);
-        }
+  const border = () => console.log(orange("═══════════════════════════════════════════════════════════"));
+  const shortAddress = addr => `${addr.slice(0,6)}...${addr.slice(-4)}`;
+  const pairName = `${inputToken.symbol}/${outputToken.symbol}`;
 
-        lastProcessedBlockPerPair.set(pairKey, startBlock);
+  border();
+  console.log("🔔 SWAP EVENT DETECTED");
+  border();
 
-        } catch (err) {
-          console.warn(`Pair error ${tokenA.symbol}/${tokenB.symbol}:`, err.message);
-        }
-      }));
-    };
+  console.log(`Pair                : ${pairName}`);
+  console.log(`Direction           : ${direction}`);
+  console.log(`Action              : ${action}`);
+  console.log(`Bought              : ${ethers.formatUnits(amountOut, outputToken.decimals)} ${outputToken.symbol}`);
+  console.log(`Sold                : ${ethers.formatUnits(amountIn, inputToken.decimals)} ${inputToken.symbol}`);
+  console.log(`Pool                : ${shortAddress(poolAddress)}`);
+  console.log(`Block               : ${eventBlock}`);
+  console.log("");
 
-  // -----------------------------
-  // 🔄 Start periodic refresh every 5 seconds
-  // -----------------------------
+  // =====================================================
+  // 5. Build Pool Snapshot
+  // =====================================================
 
-  const getDiscoveredPairs = () => [...discoveredPairsMap.values()];
+  const enrichedPools = [];
 
-  setInterval(async () => {
+  for (const p of uniquePools) {
     try {
-      await refreshPairs();
-    } catch (err) {
-      console.error("refreshPairs error:", err);
-    }
-  }, 5000);
+      const c = new ethers.Contract(p.address, POOL_ABI, provider);
+      const [poolToken0, poolToken1, poolFee, liquidity] = await Promise.all([
+        c.token0({ blockTag: eventBlock }),
+        c.token1({ blockTag: eventBlock }),
+        c.fee({ blockTag: eventBlock }),
+        c.liquidity({ blockTag: eventBlock })
+      ]);
 
-  await refreshPairs(); // initial refresh
+      const poolLiquidity = BigInt(liquidity);
+      if (poolLiquidity === 0n) continue;
 
-  // ✅ Keep one-sided map for swaps or other logic
-  const oneSidedPairsMap = {};
+      const token0 = norm(poolToken0);
+      const token1 = norm(poolToken1);
+      const poolT0 = topTokens.find(t => norm(t.address) === token0);
+      const poolT1 = topTokens.find(t => norm(t.address) === token1);
 
-  for (const p of getDiscoveredPairs()) {
-    if (p.isOneSided) {
-      const pairKey = [p.token0.address, p.token1.address]
-        .sort()
-        .join("_");
+      if (!poolT0 || !poolT1) continue;
 
-      oneSidedPairsMap[pairKey] = true;
+      const wethIsToken0 = token0 === WETH.toLowerCase();
+      const tradeTokenAddress = wethIsToken0 ? token1 : token0;
+      const poolForQuote = { ...p, address: p.address, fee: Number(poolFee), liquidity: poolLiquidity };
+
+      const tradeability = await checkPoolTradeability(
+        poolForQuote,
+        WETH,
+        tradeTokenAddress,
+        quoter,
+        factory,
+        eventBlock
+      );
+
+      enrichedPools.push({
+        ...p,
+        address: p.address,
+        fee: Number(poolFee),
+        liquidity: poolLiquidity,
+        token0,
+        token1,
+        token0Symbol: poolT0.symbol,
+        token1Symbol: poolT1.symbol,
+        tradeable: tradeability.usable === true,
+        tradeability,
+        wethIsToken0,
+        tradeToken: tradeTokenAddress
+      });
+
+    } catch (e) {
+      console.log(`❌ Pool ${p.address} error: ${e.shortMessage || e.reason || e.message}`);
     }
   }
 
-  // -----------------------------
-  // 🔄 PERIODIC LIQUIDITY UPDATE
-  // -----------------------------
+  // =====================================================
+  // 6. Rank Pools
+  // =====================================================
 
-  let updatingLiquidity = false;
+  // -----------------------------------------------------
+  // 6.1 Tradeability
+  // -----------------------------------------------------
 
-  const updateLiquidity = async () => {
-    if (updatingLiquidity) return;
+  for (const p of enrichedPools) p.tradeable = p.tradeability?.usable === true;
 
-    updatingLiquidity = true;
+  // -----------------------------------------------------
+  // 6.2 Depth / Executable Quote Filter
+  // -----------------------------------------------------
 
-    try {
-      for (const p of getDiscoveredPairs()) {
-        const { token0, token1, uPair, sPair } = p;
+  const MIN_DEPTH_RATIO = 80n;
 
-        if (!uPair && !sPair) continue;
+  const quotedPools = enrichedPools.filter(p => p.tradeable && (p.tradeability?.testAmountOut ?? 0n) > 0n && (p.tradeability?.wethReturned ?? 0n) > 0n);
+  const bestDepthOut = quotedPools.reduce((best, p) => p.tradeability.testAmountOut > best ? p.tradeability.testAmountOut : best, 0n);
 
-        const pairKey = [token0.address, token1.address]
-          .sort()
-          .join("_");
+  for (const p of enrichedPools) {
+    const quoteOut = p.tradeability?.testAmountOut ?? 0n;
+    const wethReturned = p.tradeability?.wethReturned ?? 0n;
 
-        try {
-          const cachedReserves = reserveCache.get(pairKey);
+    p.depthRatio = bestDepthOut > 0n ? Number((quoteOut * 10000n) / bestDepthOut) / 100 : 0;
 
-          if (
-            !cachedReserves ||
-            Date.now() - cachedReserves.lastUpdated > 5000
-          ) {
-            const uRes = uPair
-              ? await getReserves(
-                  uFactory,
-                  token0,
-                  token1,
-                  monitoringProvider
-                )
-              : null;
+    p.depthPassed =
+      p.tradeable &&
+      quoteOut > 0n &&
+      wethReturned > 0n &&
+      bestDepthOut > 0n &&
+      quoteOut * 100n >= bestDepthOut * MIN_DEPTH_RATIO;
 
-            const sRes = sPair
-              ? await getReserves(
-                  sFactory,
-                  token0,
-                  token1,
-                  monitoringProvider
-                )
-              : null;
+    if (!p.depthPassed) {
+      p.tradeable = false;
 
-            reserveCache.set(pairKey, {
-              uReserves: uRes,
-              sReserves: sRes,
-              lastUpdated: Date.now()
-            });
-          }
-
-          const { uReserves, sReserves } =
-            reserveCache.get(pairKey);
-
-          const maxReserve =
-            BigInt(uReserves?.reserveA || 0n) >
-            BigInt(sReserves?.reserveA || 0n)
-              ? BigInt(uReserves?.reserveA || 0n)
-              : BigInt(sReserves?.reserveA || 0n);
-
-          const liquidityValid = evaluateLiquidity({
-            reserveBase: maxReserve,
-            minTradeSize: 10n ** 16n,
-            minTokenReserve: 10n ** token0.decimals,
-            dexName: `${token0.symbol}/${token1.symbol}`
-          }).valid;
-
-          pairLiquidity[pairKey] =
-            liquidityValid ? "OK" : "LOW";
-
-        } catch (err) {
-          console.warn(
-            `Failed to update liquidity for ${token0.symbol}/${token1.symbol}:`,
-            err.message
-          );
-        }
+      if (p.tradeability) {
+        p.tradeability.reason =
+          quoteOut === 0n
+            ? "no executable quote"
+            : wethReturned === 0n
+              ? "reverse quote failed"
+              : `insufficient depth (${p.depthRatio.toFixed(2)}% of best)`;
       }
-    } finally {
-      updatingLiquidity = false;
     }
-  };
+  }
 
-  setInterval(async () => {
-    try {
-      await updateLiquidity();
-    } catch (err) {
-      console.error("updateLiquidity error:", err);
-    }
-  }, 5000);
+  // -----------------------------------------------------
+  // 6.3 Event Pool
+  // -----------------------------------------------------
 
-  // -----------------------------
-  // 🖨️ OUTPUT
-  // -----------------------------
+  const eventPool = enrichedPools.find(p => p.address.toLowerCase() === poolAddress);
+  if (!eventPool) return { pass: false };
 
-  const oneSidedPairs = getDiscoveredPairs().filter(
-    p => p.isOneSided
-  );
+  // -----------------------------------------------------
+  // 6.4 Reference Quote
+  // -----------------------------------------------------
 
-  const bothPairs = getDiscoveredPairs().filter(
-    p => p.isDirect
-  );
+  const referencePrice = eventPool.tradeability?.testAmountOut ?? 0n;
+  if (referencePrice <= 0n) return { pass: false };
 
-  console.log("\n📊 PAIR VERIFICATION:\n");
+  // -----------------------------------------------------
+  // 6.5 Liquidity Ranking
+  // -----------------------------------------------------
+
+  const maxLiquidity = enrichedPools.reduce((max, p) => p.liquidity > max ? p.liquidity : max, 0n);
+  if (maxLiquidity === 0n) return { pass: false };
+
+  for (const [i, p] of enrichedPools.entries()) {
+    p.rank = i + 1;
+    p.liquidityPercent = Number((p.liquidity * 100000n) / maxLiquidity) / 1000;
+    p.qualityLevel = p.tradeable ? "usable" : "unusable";
+    p.qualityIcon = p.tradeable ? "\x1b[32m🟢\x1b[0m" : "\x1b[31m🔴\x1b[0m";
+    p.qualityText = p.tradeable ? "Usable" : "Unusable";
+  }
+
+  // -----------------------------------------------------
+  // 6.6 Pool Ranking Display
+  // -----------------------------------------------------
+
+  border();
+  console.log("📊 POOL RANKING");
+  border();
+
+  console.log(`Event Block         : ${eventBlock}`);
+  console.log(`Pair                : ${pairName}`);
+  console.log("");
 
   console.log(
-    `🔥 ONE-SIDED PAIRS (${oneSidedPairs.length}):\n`
+    col("Rank", COL.rank) +
+    col("Fee", COL.fee) +
+    col("Liquidity", COL.liquidity) +
+    col("Quality", COL.quality) +
+    col("Price", COL.price) +
+    col("Spread", COL.spread) +
+    col("Event", COL.event)
   );
 
-  if (!oneSidedPairs.length) {
-    console.log("   None found");
-  } else {
-    for (const p of oneSidedPairs) {
+  for (const p of enrichedPools) {
+    const eventMark = p.address.toLowerCase() === poolAddress ? "★" : "";
+    const quote = p.tradeability?.testAmountOut ?? 0n;
+    const decimals = p.tradeability?.tradeDecimals ?? 18;
+    const displayPrice = Number(ethers.formatUnits(quote, decimals));
+    const priceDiff = referencePrice > 0n ? Number(((quote - referencePrice) * 10000n) / referencePrice) / 100 : 0;
+    const liquidityPct = p.liquidityPercent >= 1 ? p.liquidityPercent.toFixed(2) : p.liquidityPercent < 0.01 ? "<0.01" : p.liquidityPercent.toFixed(2);
+
+    console.log(
+      col(p.rank, COL.rank) +
+      col(`${(p.fee / 10000).toFixed(2)}%`, COL.fee) +
+      col(`${formatCompactBigInt(p.liquidity)} (${liquidityPct}%)`, COL.liquidity) +
+      col(`${p.qualityIcon} ${p.qualityText}`, COL.quality) +
+      col(displayPrice.toFixed(8), COL.price) +
+      col(`${priceDiff >= 0 ? "+" : ""}${priceDiff.toFixed(2)}%`, COL.spread) +
+      col(eventMark, COL.event)
+    );
+  }
+
+  console.log("");
+
+  // =====================================================
+  // POOL DEPTH / TRADEABILITY CHECK
+  // =====================================================
+
+  border();
+  console.log("💧 POOL DEPTH TEST");
+  border();
+
+  console.log(`Event Block         : ${eventBlock}`);
+  console.log("");
+
+  const DEPTH_TEST_AMOUNT = ethers.parseUnits("0.03", 18);
+
+  console.log(`Test Amount: ${ethers.formatUnits(DEPTH_TEST_AMOUNT, 18)} WETH`);
+
+  for (const pool of enrichedPools) {
+      const depth = pool.tradeability;
+      const amountIn = depth?.testAmountIn ?? DEPTH_TEST_AMOUNT;
+      const amountOut = depth?.testAmountOut ?? 0n;
+      const outputSymbol = pool.token0.toLowerCase() === WETH.toLowerCase() ? pool.token1Symbol : pool.token0Symbol;
+      const decimals = depth?.tradeDecimals ?? 18;
+      const fee = (Number(pool.fee) / 10000).toFixed(2);
+      const usable = pool.tradeable && amountOut > 0n;
+
+      console.log(`Pool ${fee}%`);
       console.log(
-        `🔥 ${p.pairName} (${p.uniExists ? "Uniswap only" : "Sushi only"})`
+          usable
+              ? `  ${ethers.formatUnits(amountIn, 18)} WETH → ${ethers.formatUnits(amountOut, decimals)} ${outputSymbol}  🟢 Usable`
+              : `  ${ethers.formatUnits(amountIn, 18)} WETH → QUOTE FAILED  🔴 Unusable`
+      );
+      console.log("");
+  }
+
+  // =====================================================
+  // TRADE STATUS
+  // =====================================================
+
+  const executablePools = enrichedPools.filter(p => p.tradeable);
+  const validPools = executablePools.filter(p => (p.tradeability?.testAmountOut ?? 0n) > 0n && (p.tradeability?.wethReturned ?? 0n) > 0n);
+  const validPoolsPassed = validPools.length >= 2;
+
+  console.log("Trade Status:");
+  console.log(`  Event Block        : ${eventBlock}`);
+  console.log(`  💧 Candidate Pools : ${validPoolsPassed ? "✅ Passed" : "❌ Failed"} (${validPools.length}/2 required pools)`);
+
+  if (!validPoolsPassed) return { pass: false };
+
+  // =====================================================
+  // EXECUTABLE ROUND-TRIP QUOTE
+  // =====================================================
+
+  const testAmount = ethers.parseUnits("0.03", 18);
+  if (testAmount <= 0n) return { pass: false };
+
+  let bestRoute = null;
+
+  for (let i = 0; i < validPools.length; i++) {
+      for (let j = 0; j < validPools.length; j++) {
+          if (i === j) continue;
+
+          const buyPool = validPools[i];
+          const sellPool = validPools[j];
+
+          try {
+              const tokenAmount = BigInt(
+                  (
+                      await quoter.quoteExactInputSingle.staticCall(
+                          WETH,
+                          buyPool.tradeToken,
+                          Number(buyPool.fee),
+                          testAmount,
+                          0n,
+                          { blockTag: eventBlock }
+                      )
+                  ).toString()
+              );
+
+              if (tokenAmount <= 0n) continue;
+
+              const wethReturned = BigInt(
+                  (
+                      await quoter.quoteExactInputSingle.staticCall(
+                          sellPool.tradeToken,
+                          WETH,
+                          Number(sellPool.fee),
+                          tokenAmount,
+                          0n,
+                          { blockTag: eventBlock }
+                      )
+                  ).toString()
+              );
+
+              if (wethReturned <= 0n) continue;
+
+              const profit = wethReturned - testAmount;
+
+              if (!bestRoute || profit > bestRoute.difference) {
+                  bestRoute = {
+                      buyPool,
+                      sellPool,
+                      amountIn: testAmount,
+                      amountOut: tokenAmount,
+                      amountReturned: wethReturned,
+                      difference: profit
+                  };
+              }
+
+          } catch (e) {
+              // Ignore failed routes; continue checking remaining pairs.
+          }
+      }
+  }
+
+  if (!bestRoute) return { pass: false };
+
+  // =====================================================
+  // BEST ROUTE DISPLAY
+  // =====================================================
+
+  const spreadPercent = Number(bestRoute.difference) / Number(bestRoute.amountIn) * 100;
+  const tokenDecimals = bestRoute.buyPool.tradeability?.tradeDecimals ?? 18;
+
+  console.log(
+      `  🔎 Best Route: ${(bestRoute.buyPool.fee / 10000).toFixed(2)}% → ${(bestRoute.sellPool.fee / 10000).toFixed(2)}%` +
+      ` | ${ethers.formatUnits(bestRoute.amountIn, 18)} WETH` +
+      ` → ${ethers.formatUnits(bestRoute.amountOut, tokenDecimals)}` +
+      ` → ${ethers.formatUnits(bestRoute.amountReturned, 18)} WETH` +
+      ` | ${spreadPercent >= 0 ? "+" : ""}${spreadPercent.toFixed(6)}%`
+  );
+
+  // =====================================================
+  // EXECUTABLE ROUND-TRIP DIFFERENCE
+  // =====================================================
+
+  const roundTripDifference = Number(bestRoute.difference) / Number(bestRoute.amountIn) * 100;
+  const executablePassed = bestRoute && bestRoute.difference > 0n;
+
+  // =====================================================
+  // STORE BEST TRADE CANDIDATE
+  // =====================================================
+
+  bestTrade = {
+    buyPool: bestRoute.buyPool,
+    sellPool: bestRoute.sellPool,
+    spread: roundTripDifference * 1e16,
+    spreadPercent: roundTripDifference,
+    requiredSpread: REQUIRED_GROSS_SPREAD,
+    testAmountIn: bestRoute.amountIn,
+    testAmountOut: bestRoute.amountOut,
+    wethReturned: bestRoute.amountReturned
+  };
+
+  if (executablePassed) {
+    totalRoutesChecked++;
+  }
+
+  // =====================================================
+  // PRE-CHECK RESULT
+  // =====================================================
+
+  const spreadPassed = bestTrade !== null && bestTrade.spreadPercent >= REQUIRED_GROSS_SPREAD;
+  const spreadStatus = spreadPassed ? "✅ Passed" : "❌ Failed";
+  const poolFeePercent = bestTrade ? (Number(bestTrade.buyPool.fee) + Number(bestTrade.sellPool.fee)) / 10000 : 0;
+
+  console.log(`  📈 Round Trip Gross Spread     : ${spreadStatus} (${bestTrade ? `${bestTrade.spreadPercent >= 0 ? "+" : ""}${bestTrade.spreadPercent.toFixed(6)}%` : "0.000000%"} / +${REQUIRED_GROSS_SPREAD.toFixed(2)}%)`);
+  console.log(`  💸 Pool Fees                   : ${poolFeePercent.toFixed(2)}%`);
+
+  // =====================================================
+  // PRE-CHECK DECISION
+  // =====================================================
+
+  if (!validPoolsPassed || !spreadPassed) return { pass: false };
+
+  console.log("  🔎 Executable quote pre-checks passed - analyzing routes");
+
+  // =====================================================
+  // 7. FIND BEST ARBITRAGE CANDIDATE
+  // =====================================================
+
+  if (executablePools.length < 2 || !bestTrade) return { pass: false };
+
+  console.log("");
+  console.log("Trade Selection:");
+  console.log("  ✅ Valid arbitrage candidate found");
+  console.log("");
+
+  // =====================================================
+  // 8. Build Trade Candidate
+  // =====================================================
+
+  let tradeCandidate = null;
+
+  if (bestTrade) {
+    const buyPool = bestTrade.buyPool;
+    const sellPool = bestTrade.sellPool;
+    const eventType = inputToken.address.toLowerCase() === WETH.toLowerCase() ? "PUMP" : "DUMP";
+    const tradeToken = eventType === "PUMP" ? outputToken : inputToken;
+    const flashToken = topTokens.find(t => t.address.toLowerCase() === WETH.toLowerCase());
+
+    tradeCandidate = {
+      pair: pairName,
+      eventBlock,
+      flashToken,
+      tradeToken,
+      tokenIn: flashToken,
+      tokenOut: tradeToken,
+      eventDirection: `${inputToken.symbol} → ${outputToken.symbol}`,
+      executionDirection: `${flashToken.symbol} → ${tradeToken.symbol} → ${flashToken.symbol}`,
+      eventType,
+
+      firstSwap: {
+        pool: buyPool.address,
+        tokenIn: flashToken,
+        tokenOut: tradeToken,
+        fee: Number(buyPool.fee),
+        liquidity: buyPool.liquidity,
+        quoteIn: buyPool.tradeability?.testAmountIn ?? 0n,
+        quoteOut: buyPool.tradeability?.testAmountOut ?? 0n
+      },
+
+      secondSwap: {
+        pool: sellPool.address,
+        tokenIn: tradeToken,
+        tokenOut: flashToken,
+        fee: Number(sellPool.fee),
+        liquidity: sellPool.liquidity,
+        quoteIn: sellPool.tradeability?.testAmountOut ?? 0n,
+        quoteOut: sellPool.tradeability?.wethReturned ?? 0n
+      },
+
+      spread: {
+        difference: bestTrade.spread,
+        percent: bestTrade.spreadPercent,
+        requiredSpread: bestTrade.requiredSpread
+      }
+    };
+  }
+
+  // =====================================================
+  // 9. Display Analysis
+  // =====================================================
+
+  if (tradeCandidate) {
+    const buy = tradeCandidate.firstSwap;
+    const sell = tradeCandidate.secondSwap;
+    const token = tradeCandidate.tradeToken;
+    const weth = tradeCandidate.flashToken;
+    const buyIn = ethers.formatUnits(buy.quoteIn, weth.decimals);
+    const buyOut = ethers.formatUnits(buy.quoteOut, token.decimals);
+    const sellIn = ethers.formatUnits(sell.quoteIn, token.decimals);
+    const sellOut = ethers.formatUnits(sell.quoteOut, weth.decimals);
+    const spread = Number(tradeCandidate.spread?.percent ?? 0);
+    const required = Number(tradeCandidate.spread?.requiredSpread ?? 0);
+
+    border();
+    console.log("📊 BEST TRADE CANDIDATE");
+    border();
+
+    console.log(`Event               : ${tradeCandidate.eventType}`);
+    console.log(`Event Direction     : ${tradeCandidate.eventDirection}`);
+    console.log(`Execution Direction : ${tradeCandidate.executionDirection}`);
+    console.log(`Event Block         : ${tradeCandidate.eventBlock}`);
+    console.log(`Flash Token         : ${weth.symbol}`);
+    console.log(`Trade Token         : ${token.symbol}`);
+
+    console.log("");
+    console.log("Buy Pool:");
+    console.log(`  Fee              : ${buy.fee} (${(buy.fee / 10000).toFixed(2)}%)`);
+    console.log(`  Address          : ${shortAddress(buy.pool)}`);
+    console.log(`  Test Quote       : ${buyIn} ${weth.symbol} → ${buyOut} ${token.symbol}`);
+
+    console.log("");
+    console.log("Sell Pool:");
+    console.log(`  Fee              : ${sell.fee} (${(sell.fee / 10000).toFixed(2)}%)`);
+    console.log(`  Address          : ${shortAddress(sell.pool)}`);
+    console.log(`  Test Quote       : ${sellIn} ${token.symbol} → ${sellOut} ${weth.symbol}`);
+
+    console.log("");
+    console.log("Price Advantage (Quoter Test):");
+    console.log(`  Buy Output       : ${buyOut} ${token.symbol}`);
+    console.log(`  Sell Return      : ${sellOut} ${weth.symbol}`);
+    console.log(`  Price Difference : ${spread >= 0 ? "+" : ""}${spread.toFixed(2)}%`);
+
+    console.log("");
+    console.log("Executable Quote Pre-check:");
+    console.log(`  Quote Difference : ${spread >= 0 ? "+" : ""}${spread.toFixed(2)}%`);
+    console.log(`  Required         : +${required.toFixed(2)}%`);
+    console.log(`  Status           : ${spread >= required ? "✅ Passed" : "❌ Failed"}`);
+    console.log("");
+  }
+
+  // =====================================================
+  // 10. Return Result
+  // =====================================================
+
+  if (!tradeCandidate) return { pass: false };
+
+  return {
+    pass: true,
+    eventInput: inputToken,
+    eventOutput: outputToken,
+    eventDirection: `${inputToken.symbol} → ${outputToken.symbol}`,
+    tradeCandidate,
+
+    trade: {
+      buyPool: tradeCandidate.firstSwap,
+      sellPool: tradeCandidate.secondSwap,
+      tokenIn: tradeCandidate.firstSwap.tokenIn,
+      tokenOut: tradeCandidate.firstSwap.tokenOut,
+
+      firstSwap: {
+        pool: tradeCandidate.firstSwap.pool,
+        tokenIn: tradeCandidate.firstSwap.tokenIn,
+        tokenOut: tradeCandidate.firstSwap.tokenOut,
+        fee: tradeCandidate.firstSwap.fee,
+        liquidity: tradeCandidate.firstSwap.liquidity
+      },
+
+      secondSwap: {
+        pool: tradeCandidate.secondSwap.pool,
+        tokenIn: tradeCandidate.secondSwap.tokenIn,
+        tokenOut: tradeCandidate.secondSwap.tokenOut,
+        fee: tradeCandidate.secondSwap.fee,
+        liquidity: tradeCandidate.secondSwap.liquidity
+      },
+
+      spread: {
+        difference: tradeCandidate.spread.difference,
+        percent: tradeCandidate.spread.percent
+      }
+    },
+
+    amountIn,
+    eventBlock,
+    poolAddress,
+
+    routeContext: {
+      finalPools: enrichedPools,
+      eventBlock,
+      baseToken: inputToken,
+      targetToken: outputToken,
+      tokens: topTokens,
+      fee
+    }
+  };
+}
+
+// ─────────────────────────────────────────────
+// CheckProfit will determine if there is a profitable path (Multi-Hop engine)
+// ─────────────────────────────────────────────
+async function checkProfit(ctx, params) {
+  const { executionProvider: provider, signer, arbitrageContract, minProfit, quoter, factory } = ctx;
+  const { tradeCandidate, eventBlock } = params;
+
+  if (!provider) throw new Error("checkProfit missing provider");
+  if (!tradeCandidate) {
+    console.log("❌ Missing trade candidate");
+    return { profitable: false };
+  }
+
+  const fmt = (value, decimals, digits = 6) => Number(ethers.formatUnits(value, decimals)).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  const border = () => console.log(orange("═══════════════════════════════════════════════════════════"));
+
+  const flashToken = tradeCandidate.flashToken;
+  const tradeToken = tradeCandidate.tradeToken;
+  const buySwap = tradeCandidate.firstSwap;
+  const sellSwap = tradeCandidate.secondSwap;
+  const flashDecimals = flashToken.decimals ?? 18;
+  const tradeDecimals = tradeToken.decimals ?? 18;
+  const profitCheckStart = performance.now();
+  const PRICE_SCALE = 10n ** 18n;
+
+  if (eventBlock == null) {
+      throw new Error("checkProfit missing eventBlock");
+    }
+
+  const quoteBlock = eventBlock;
+
+  border();
+  console.log("💰 PROFIT CHECK");
+  border();
+
+  // =====================================================
+  // TEST LOAN SIZES
+  // =====================================================
+
+  const flashAmountLimit = ethers.parseUnits("100", flashDecimals);
+  const testSizes = generateLoanSizes(flashAmountLimit, flashDecimals);
+
+  const results = [];
+  let best = null;
+
+  for (const amountIn of testSizes) {
+    try {
+      const amountBorrowed = amountIn;
+
+    // =====================================================
+    // EXACT QUOTER: WETH → LINK
+    // =====================================================
+
+    const tradeAmount = BigInt(
+      (
+        await quoter.quoteExactInputSingle.staticCall(
+          flashToken.address,
+          tradeToken.address,
+          Number(buySwap.fee),
+          amountBorrowed,
+          0n,
+          { blockTag: quoteBlock }
+        )
+      ).toString()
+    );
+
+    // =====================================================
+    // EXACT QUOTER: LINK → WETH
+    // =====================================================
+
+    const amountReturned = BigInt(
+      (
+        await quoter.quoteExactInputSingle.staticCall(
+          tradeToken.address,
+          flashToken.address,
+          Number(sellSwap.fee),
+          tradeAmount,
+          0n,
+          { blockTag: quoteBlock }
+        )
+      ).toString()
+    );
+
+    // =====================================================
+    // FLASH LOAN FEE
+    // =====================================================
+
+    const BALANCER_FLASH_FEE_BPS = 0n;
+    const flashFee = amountBorrowed * BALANCER_FLASH_FEE_BPS / 10000n;
+    const grossProfit = amountReturned - amountBorrowed;
+
+    let gasCost = 0n;
+    let gasEstimate = 0n;
+    let gasPrice = 0n;
+
+    try {
+      const arb = arbitrageContract.connect(signer);
+      const feeData = await provider.getFeeData();
+      gasPrice = feeData.gasPrice ?? 0n;
+
+      const cleanRoute = [
+        {dex:0, tokenIn:buySwap.tokenIn.address, tokenOut:buySwap.tokenOut.address, fee:buySwap.fee},
+        {dex:0, tokenIn:sellSwap.tokenIn.address, tokenOut:sellSwap.tokenOut.address, fee:sellSwap.fee}
+      ];
+
+      gasEstimate = await arb.executeTrade.estimateGas(
+        flashToken.address,
+        amountBorrowed,
+        cleanRoute,
+        minProfit
+      );
+
+      gasCost = gasEstimate * gasPrice;
+    } catch (e) {
+      continue;
+    }
+
+    const netProfit = grossProfit - flashFee - gasCost;
+
+    const result = {
+      size: ethers.formatUnits(amountBorrowed, flashDecimals),
+      amountIn: amountBorrowed,
+      buyAmount: tradeAmount,
+      sellAmount: amountReturned,
+      flashFee,
+      grossProfit,
+      gasEstimate,
+      gasPrice,
+      gasCost,
+      netProfit
+    };
+
+    results.push(result);
+
+    if (!best || netProfit > best.netProfit) best = result;
+
+    } catch (e) {
+      console.log(
+        "❌ Profit calculation failed:",
+        ethers.formatUnits(amountIn, flashDecimals),
+        e.shortMessage || e.message
       );
     }
   }
 
+  const profitCheckLatency = Math.round(performance.now() - profitCheckStart);
+
+  if (!best) {
+    console.log("❌ No valid loan calculations");
+    return { profitable: false };
+  }
+
+  // =====================================================
+  // FINAL PROFIT
+  // =====================================================
+
+  const repayment = best.amountIn + best.flashFee;
+  const roi = Number(best.netProfit) / Number(best.amountIn) * 100;
+  const profitable = best.netProfit >= minProfit;
+
+  const block = eventBlock;
+  const latestBlock = await provider.getBlockNumber();
+
+  console.log(`Pair                 : ${flashToken.symbol}/${tradeToken.symbol}`);
+  console.log(`Route                : ${buySwap.tokenIn.symbol} → ${buySwap.tokenOut.symbol} → ${sellSwap.tokenOut.symbol}`);
+  console.log(`Pools                : ${(Number(buySwap.fee) / 10000).toFixed(2)}% → ${(Number(sellSwap.fee) / 10000).toFixed(2)}%`);
+  console.log(`Candidate Source     : analyze()`);
+  console.log(`Profit Source        : Exact Uniswap V3 Quoter`);
+  console.log(`Profit Check Latency : ${profitCheckLatency} ms`);
+  console.log(`Event Block          : ${eventBlock}`);
+  console.log(`Quote Block          : ${quoteBlock}`);
+  console.log(`Latest Block         : ${latestBlock}`);
+  console.log(`Block Lag            : ${latestBlock - eventBlock}`);
+
+  // =====================================================
+  // LOAN TESTS
+  // =====================================================
+
+  results.sort((a, b) => a.netProfit === b.netProfit ? 0 : a.netProfit > b.netProfit ? -1 : 1);
+
+  console.log("\nLoan Tests");
+  console.log("──────────────────────────────────────────────────────────────────────────────");
   console.log(
-    `\n✅ BOTH-SIDED PAIRS (${bothPairs.length}):\n`
+    `Loan ${flashToken.symbol}`.padEnd(12) +
+    `Buy Output ${tradeToken.symbol}`.padEnd(19) +
+    `Sell Output ${flashToken.symbol}`.padEnd(20) +
+    `Gross ${flashToken.symbol}`.padEnd(15) +
+    `Gas ${flashToken.symbol}`.padEnd(13) +
+    `Net ${flashToken.symbol}`.padEnd(15) +
+    "ROI"
   );
 
-  for (const p of bothPairs) {
-    const pairKey = [p.token0.address, p.token1.address]
-      .sort()
-      .join("_");
+
+  for (const [index, r] of results.slice(0, 3).entries()) {
+    const roi = Number(r.netProfit) / Number(r.amountIn) * 100;
+
+    const profitSign = r.netProfit >= 0n ? "+" : "";
+    const status = r.netProfit >= minProfit ? "✅" : "❌";
+    const mark = index === 0 ? " ★ Best" : "";
+
+    const loan = fmt(r.amountIn, flashDecimals, 6);
+    const buyOutput = fmt(r.buyAmount, tradeDecimals, 6);
+    const sellOutput = fmt(r.sellAmount, flashDecimals, 8);
+    const gross = `${r.grossProfit >= 0n ? "+" : ""}${fmt(r.grossProfit, flashDecimals, 8)}`;
+    const gas = fmt(r.gasCost, flashDecimals, 8);
+    const net = `${profitSign}${fmt(r.netProfit, flashDecimals, 8)}`;
 
     console.log(
-      `✅ ${p.pairName} (Uniswap + Sushi) | Liquidity: ${pairLiquidity[pairKey]}`
+      loan.padEnd(12) +
+      `${buyOutput}`.padEnd(19) +
+      `${sellOutput}`.padEnd(20) +
+      `${gross}`.padEnd(15) +
+      `${gas}`.padEnd(13) +
+      `${net}`.padEnd(15) +
+      `${roi.toFixed(2)}% ${status}${mark}`
     );
   }
 
-  console.log(`\n🌉 STABLE BRIDGE COVERAGE:`);
-  console.log(`🟢 FULL (USDC + DAI + USDT): ${bridgeFull}`);
-  console.log(`🟡 PARTIAL (2/3): ${bridgePartial}`);
-  console.log(`🟠 MINIMAL (1/3): ${bridgeMinimal}`);
-  console.log(`⚪ NONE: ${bridgeNone}`);
+  // =====================================================
+  // BEST RESULT
+  // =====================================================
 
-  console.log("\n🧠 ROUTING SCORES:");
+  const bestRoi = Number(best.netProfit) / Number(best.amountIn) * 100;
+  const bestProfitSign = best.netProfit >= 0n ? "+" : "";
+  const bestGrossSign = best.grossProfit >= 0n ? "+" : "";
+  let expectedUsdc = null;
 
-  const printedPairs = new Set();
+  const USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
+  const USDC_DECIMALS = 6;
+  const USDC_QUOTE_FEE = 500;
 
-  for (const p of getDiscoveredPairs()) {
-    const pairKey = [
-      p.token0.address,
-      p.token1.address
-    ]
-      .sort()
-      .join("_");
-
-    if (printedPairs.has(pairKey)) continue;
-
-    printedPairs.add(pairKey);
-
-    console.log(
-      `${p.pairName}: ${p.routingScore}/30 | Liquidity: ${
-        pairLiquidity[pairKey] === "OK"
-          ? "✅"
-          : "⚠"
-      }`
-    );
+  if (best.netProfit > 0n && quoter) {
+    try {
+      expectedUsdc = BigInt((await quoter.quoteExactInputSingle.staticCall(
+        flashToken.address,
+        USDC,
+        USDC_QUOTE_FEE,
+        best.netProfit,
+        0n,
+        { blockTag: quoteBlock }
+      )).toString());
+    } catch (e) {
+      expectedUsdc = null;
+    }
   }
 
-  startMonitoring();
+  console.log("");
+  console.log("🏆 BEST RESULT");
+  console.log("───────────────────────────────────────────────────────────");
 
-  // ============================================================
-  // 8️⃣ SHARED STATE + 9️⃣ SWAP EVENT WRAPPER
-  // ============================================================
+  console.log(`Borrowed             : ${fmt(best.amountIn, flashDecimals, 6)} ${flashToken.symbol}`);
 
-  const processedTxHashes = new Set();
-  const skippedFirstEventPerPair = {};
-  const lastTradePerPair = {};
-  const lastExecutionTimePerPair = {};
-  const isExecutingTradePerPair = {};
+  console.log("");
+  console.log(`Swap 1 — ${flashToken.symbol} → ${tradeToken.symbol}`);
+  console.log(`Input                : ${fmt(best.amountIn, flashDecimals, 6)} ${flashToken.symbol}`);
+  console.log(`Quoted Output        : ${fmt(best.buyAmount, tradeDecimals, 4)} ${tradeToken.symbol}`);
+  console.log(
+    `Math                 : ${fmt(best.amountIn, flashDecimals, 8)} ${flashToken.symbol} → ` +
+    `${fmt(best.buyAmount, tradeDecimals, 8)} ${tradeToken.symbol}`
+  );
+  console.log("");
+  console.log(`Swap 2 — ${tradeToken.symbol} → ${flashToken.symbol}`);
+  console.log(`Input                : ${fmt(best.buyAmount, tradeDecimals, 4)} ${tradeToken.symbol}`);
+  console.log(`Quoted Output        : ${fmt(best.sellAmount, flashDecimals, 6)} ${flashToken.symbol}`);
+  console.log(
+    `Math                 : ${fmt(best.buyAmount, tradeDecimals, 8)} ${tradeToken.symbol} → ` +
+    `${fmt(best.sellAmount, flashDecimals, 8)} ${flashToken.symbol}`
+  );
 
-  const refs = {
-    signer,
-    lastSubmittedTxHash: null,
-    goodTradesCounter: 0
-  };
+  console.log("");
+  console.log(`Gross Profit         : ${bestGrossSign}${fmt(best.grossProfit, flashDecimals, 8)} ${flashToken.symbol}`);
+  console.log(`Flash Fee            : -${fmt(best.flashFee, flashDecimals, 8)} ${flashToken.symbol}`);
+  console.log(`Gas Estimate         : ${best.gasEstimate.toString()}`);
+  console.log(`Gas Price            : ${ethers.formatUnits(best.gasPrice, "gwei")} gwei`);
+  console.log(`Gas Cost             : -${fmt(best.gasCost, flashDecimals, 8)} ${flashToken.symbol}`);
 
-  const buildSwapCall = (
-    exchange,
-    event,
-    token0,
-    token1,
-    savedRoutingScore
-  ) =>
-    swapEvent({
-      exchange,
-      event,
-      token0,
-      token1,
-      routingScore: savedRoutingScore,
-      monitoringProvider,
-      topTokens,
-      startBlock,
-      processedTxHashes,
-      skippedFirstEventPerPair,
-      lastTradePerPair,
-      lastExecutionTimePerPair,
-      isExecutingTradePerPair,
-      pauseMonitoring,
-      resumeMonitoring,
-      determineDirection,
-      determineProfit,
-      executeTrade,
-      uFactory,
-      sFactory,
-      uRouter,
-      sRouter,
-      usdcToken,
-      FLASH_LOAN_SIZE,
-      networkType,
-      executionProvider,
-      refs,
-      pairLiquidityMap: pairLiquidity,
-      oneSidedPairsMap,
-      reserveCache
-    });
+  console.log("───────────────────────────────────────────────────────────");
 
-  // dynamic pair getter
-  const getPairs = () => getDiscoveredPairs();
+  console.log(`Net Profit           : ${bestProfitSign}${fmt(best.netProfit, flashDecimals, 8)} ${flashToken.symbol}`);
+  console.log(`ROI                  : ${bestRoi.toFixed(2)}%`);
+  console.log(`Minimum Required     : ${fmt(minProfit, flashDecimals, 8)} ${flashToken.symbol}`);
+  console.log(`USDC Value           : ${expectedUsdc !== null ? `+$${fmt(expectedUsdc, USDC_DECIMALS, 2)}` : "N/A"}`);
+  console.log(`Decision             : ${profitable ? "✅ EXECUTE" : "❌ SKIP"}`);
+  console.log("");
 
-  // ============================================================
-  // 🔟 EVENT MODE (POLLING OPTIMIZED / WEBSOCKET SAFE)
-  // ============================================================
-  if (isLocal || type === "FORK") {
-    console.log("⚠️ Polling mode (local/fork)");
+  
 
-    setInterval(async () => {
-      const currentBlock = await executionProvider.getBlockNumber();
+  ////////////////////////////////////////////
 
-      for (const pair of getPairs()) {
-        const token0 = pair.token0;
-        const token1 = pair.token1;
-        const uPair = pair.uPair;
-        const sPair = pair.sPair;
+  // =====================================================
+  // 🧪 TEST: EXACT UNISWAP V3 WETH → LINK → WETH QUOTE
+  // =====================================================
 
-        // SAVE STABLE ROUTING SCORE
-        const savedRoutingScore = BigInt(pair.routingScore);
+  console.log("───────────────────────────────────────────────────────────");
+  console.log(`🧪 EXACT QUOTER TEST (${flashToken.symbol} → ${tradeToken.symbol} → ${flashToken.symbol})`);
+  console.log("───────────────────────────────────────────────────────────");
 
-        const pairKey = [token0.address, token1.address].sort().join("_");
-        const lastBlock = lastProcessedBlockPerPair.get(pairKey) || (currentBlock - 10);
+  let exactQuoteBuy = null;
+  let exactQuoteSell = null;
+  let exactQuoteReturn = null;
+  let exactQuoteProfit = null;
 
-        // -----------------------------
-        // Poll Uniswap logs
-        if (uPair) {
-          const logs = await uPair.queryFilter(
-            uPair.filters.Swap(),
-            lastBlock + 1,
-            currentBlock
-          );
+  // =====================================================
+  // 🔎 QUOTER ROUTE DEBUG
+  // =====================================================
 
-          for (const log of logs) {
-            await buildSwapCall(
-              "Uniswap",
-              log,
-              token0,
-              token1,
-              savedRoutingScore
-            );
-          }
-        }
+  console.log("");
+  console.log("🔎 QUOTER ROUTE DEBUG");
+  console.log("───────────────────────────────────────────────────────────");
+  console.log(`Quote Block          : ${quoteBlock}`);
 
-        // -----------------------------
-        // Poll Sushi logs
-        if (sPair) {
-          const logs = await sPair.queryFilter(
-            sPair.filters.Swap(),
-            lastBlock + 1,
-            currentBlock
-          );
+  // =====================================================
+  // 📈 SPOT PRICE DEBUG
+  // =====================================================
 
-          for (const log of logs) {
-            await buildSwapCall(
-              "Sushi",
-              log,
-              token0,
-              token1,
-              savedRoutingScore
-            );
-          }
-        }
+  try {
+    const spotBuy = await quoter.quoteExactInputSingle.staticCall(
+      flashToken.address,
+      tradeToken.address,
+      Number(buySwap.fee),
+      ethers.parseUnits("1", flashDecimals),
+      0n,
+      { blockTag: quoteBlock }
+    );
 
-        lastProcessedBlockPerPair.set(pairKey, currentBlock);
+    const spotSell = await quoter.quoteExactInputSingle.staticCall(
+      tradeToken.address,
+      flashToken.address,
+      Number(sellSwap.fee),
+      ethers.parseUnits("1", tradeDecimals),
+      0n,
+      { blockTag: quoteBlock }
+    );
+
+    const buyRateWethToToken = Number(ethers.formatUnits(spotBuy, tradeDecimals));
+    const sellRateTokenToWeth = Number(ethers.formatUnits(spotSell, flashDecimals));
+    const sellRateWethToToken = 1 / sellRateTokenToWeth;
+
+    console.log("");
+    console.log("📈 EXACT 1-UNIT QUOTES");
+    console.log("───────────────────────────────────────────────────────────");
+    console.log(`Buy Pool Quote       : 1 ${flashToken.symbol} → ` + `${buyRateWethToToken.toFixed(8)} ${tradeToken.symbol}`);
+    console.log(`Sell Pool Equivalent : 1 ${flashToken.symbol} → ` + `${sellRateWethToToken.toFixed(8)} ${tradeToken.symbol}`);
+
+    console.log(`Buy Pool             : ${buySwap.pool}`);
+    console.log(`Sell Pool            : ${sellSwap.pool}`);
+    console.log(`Buy Fee              : ${Number(buySwap.fee)} (${(Number(buySwap.fee) / 10000).toFixed(2)}%)`);
+    console.log(`Sell Fee             : ${Number(sellSwap.fee)} (${(Number(sellSwap.fee) / 10000).toFixed(2)}%)`);
+
+  } catch (e) {
+    console.log("❌ Spot price debug failed:", e.shortMessage || e.message);
+  }
+
+  const analyzeBuyPool = buySwap.pool;
+  const analyzeSellPool = sellSwap.pool;
+
+  let factoryBuyPool = null;
+  let factorySellPool = null;
+
+  console.log("");
+  console.log("BUY LEG");
+  console.log(`Token In             : ${flashToken.address} (${flashToken.symbol})`);
+  console.log(`Token Out            : ${tradeToken.address} (${tradeToken.symbol})`);
+  console.log(`Fee                  : ${Number(buySwap.fee)}`);
+  console.log(`analyze() Pool       : ${analyzeBuyPool || "UNKNOWN"}`);
+
+  console.log("");
+  console.log("SELL LEG");
+  console.log(`Token In             : ${tradeToken.address} (${tradeToken.symbol})`);
+  console.log(`Token Out            : ${flashToken.address} (${flashToken.symbol})`);
+  console.log(`Fee                  : ${Number(sellSwap.fee)}`);
+  console.log(`analyze() Pool       : ${analyzeSellPool || "UNKNOWN"}`);
+
+  // =====================================================
+  // 🏭 VERIFY POOLS THROUGH UNISWAP V3 FACTORY
+  // =====================================================
+
+  if (factory) {
+    try {
+      factoryBuyPool = await factory.getPool(flashToken.address, tradeToken.address, Number(buySwap.fee), { blockTag: quoteBlock });
+      factorySellPool = await factory.getPool(tradeToken.address, flashToken.address, Number(sellSwap.fee), { blockTag: quoteBlock });
+
+      const buyPoolMatch = analyzeBuyPool && factoryBuyPool && analyzeBuyPool.toLowerCase() === factoryBuyPool.toLowerCase();
+      const sellPoolMatch = analyzeSellPool && factorySellPool && analyzeSellPool.toLowerCase() === factorySellPool.toLowerCase();
+
+      console.log("");
+      console.log("🏭 FACTORY POOL VERIFICATION");
+      console.log("───────────────────────────────────────────────────────────");
+      console.log(`BUY Pool — analyze() : ${analyzeBuyPool || "UNKNOWN"}`);
+      console.log(`BUY Pool — factory   : ${factoryBuyPool || "UNKNOWN"}`);
+      console.log(`BUY Pool Match       : ${buyPoolMatch ? "✅ YES" : "❌ NO"}`);
+      console.log("");
+      console.log(`SELL Pool — analyze(): ${analyzeSellPool || "UNKNOWN"}`);
+      console.log(`SELL Pool — factory  : ${factorySellPool || "UNKNOWN"}`);
+      console.log(`SELL Pool Match      : ${sellPoolMatch ? "✅ YES" : "❌ NO"}`);
+
+      if (!buyPoolMatch || !sellPoolMatch) {
+        console.log("");
+        console.log("🚨 POOL MISMATCH DETECTED");
+        console.log("analyze() and Uniswap Factory resolved different pools.");
       }
-    }, 1000);
-
+    } catch (e) {
+      console.log("❌ Factory pool verification failed:", e.shortMessage || e.message);
+    }
   } else {
-    console.log("✅ WebSocket mode");
-
-    for (const pair of getDiscoveredPairs()) {
-      const token0 = pair.token0;
-      const token1 = pair.token1;
-      const uPair = pair.uPair;
-      const sPair = pair.sPair;
-
-      // SAVE STABLE ROUTING SCORE
-      const savedRoutingScore = BigInt(pair.routingScore);
-
-      if (uPair) {
-        uPair.on(uPair.filters.Swap(), (...args) =>
-          buildSwapCall(
-            "Uniswap",
-            args[args.length - 1],
-            token0,
-            token1,
-            savedRoutingScore
-          )
-        );
-      }
-
-      if (sPair) {
-        sPair.on(sPair.filters.Swap(), (...args) =>
-          buildSwapCall(
-            "Sushi",
-            args[args.length - 1],
-            token0,
-            token1,
-            savedRoutingScore
-          )
-        );
-      }
-    }
+    console.log("⚠️ Factory unavailable - pool verification skipped");
   }
-}
-
-// ─────────────────────────────────────────
-// SWAP HANDLER (REFACTORED PROPERLY)
-// ─────────────────────────────────────────
-async function swapEvent(params) {
-  const {
-    exchange,
-    event,
-    token0,
-    token1,
-    routingScore,
-    monitoringProvider,
-    topTokens,
-    startBlock,
-    processedTxHashes,
-    skippedFirstEventPerPair,
-    lastTradePerPair,
-    lastExecutionTimePerPair,
-    isExecutingTradePerPair,
-    pauseMonitoring,
-    resumeMonitoring,
-    determineDirection,
-    determineProfit,
-    executeTrade,
-    uFactory,
-    sFactory,
-    uRouter,
-    sRouter,
-    usdcToken,
-    FLASH_LOAN_SIZE,
-    networkType,
-    executionProvider,
-    refs,
-    pairLiquidityMap,
-    oneSidedPairsMap,
-    reserveCache
-  } = params;
-
-  // ============================================================
-  // 🔹 INTERNAL QUEUE (SCOPED TO FUNCTION SYSTEM)
-  // ============================================================
-
-  if (!refs._swapQueue) refs._swapQueue = [];
-  if (refs._isProcessingSwapQueue === undefined) refs._isProcessingSwapQueue = false;
-
-  refs._swapQueue.push(params);
-
-  // ============================================================
-  // 🔹 QUEUE DRAINER (RUNS INLINE, NO OUTSIDE FUNCTIONS)
-  // ============================================================
-
-  if (refs._isProcessingSwapQueue) return;
-  refs._isProcessingSwapQueue = true;
-
-  const ORANGE = "\x1b[38;5;208m";
-  const RESET = "\x1b[0m";
-
-  try {
-    while (refs._swapQueue.length > 0) {
-      const p = refs._swapQueue.shift();
-      if (!p) continue;
-
-      let monitoringPaused = false;
-
-      try {
-        const {
-          exchange,
-          event,
-          token0,
-          token1,
-          routingScore,
-          monitoringProvider,
-          topTokens,
-          startBlock,
-          processedTxHashes,
-          skippedFirstEventPerPair,
-          lastTradePerPair,
-          lastExecutionTimePerPair,
-          isExecutingTradePerPair,
-          pauseMonitoring,
-          resumeMonitoring,
-          determineDirection,
-          determineProfit,
-          executeTrade,
-          uFactory,
-          sFactory,
-          uRouter,
-          sRouter,
-          usdcToken,
-          FLASH_LOAN_SIZE,
-          networkType,
-          executionProvider,
-          refs,
-          pairLiquidityMap,
-          oneSidedPairsMap,
-          reserveCache
-        } = p;
-
-        const txHash = event.log?.transactionHash || event.transactionHash;
-        if (!txHash) continue;
 
-        if (processedTxHashes.has(txHash)) continue;
-        processedTxHashes.add(txHash);
-
-        if (processedTxHashes.size > 50000) {
-          const first = processedTxHashes.values().next().value;
-          processedTxHashes.delete(first);
-        }
-
-        const blockNumber =
-          event.log?.blockNumber ||
-          event.blockNumber ||
-          (await monitoringProvider.getBlockNumber());
-
-        if (blockNumber <= startBlock) continue;
-
-        // ============================================================
-        // TOKEN DIRECTION
-        // ============================================================
-
-        let amountIn, rawInput, rawOutput;
-
-        if (event.args.amount0In > 0n) {
-          amountIn = event.args.amount0In;
-          rawInput = token0;
-          rawOutput = token1;
-        } else if (event.args.amount1In > 0n) {
-          amountIn = event.args.amount1In;
-          rawInput = token1;
-          rawOutput = token0;
-        } else {
-          continue;
-        }
-
-        const inputToken = topTokens.find(
-          t => t.address.toLowerCase() === rawInput.address.toLowerCase()
-        );
-
-        const outputToken = topTokens.find(
-          t => t.address.toLowerCase() === rawOutput.address.toLowerCase()
-        );
-
-        if (!inputToken || !outputToken) continue;
-
-        const pairKey = [inputToken.address, outputToken.address].sort().join("_");
-
-        // ============================================================
-        // PER-PAIR LOCKS (UNCHANGED)
-        // ============================================================
-
-        if (!skippedFirstEventPerPair[pairKey]) {
-          skippedFirstEventPerPair[pairKey] = true;
-          continue;
-        }
-
-        if (isExecutingTradePerPair[pairKey]) continue;
-
-        const now = Date.now();
-        if (now - (lastExecutionTimePerPair[pairKey] || 0) < 3000) continue;
-
-        if (lastTradePerPair[pairKey] === blockNumber) continue;
-
-        const isWethPair =
-          inputToken.symbol === "WETH" || outputToken.symbol === "WETH";
-
-        if (!isWethPair) continue;
-
-        // ============================================================
-        // OUTPUT (UNCHANGED)
-        // ============================================================
-
-        pauseMonitoring();
-        monitoringPaused = true;
-
-        console.log(ORANGE + "═══════════════════════════════════════════════════════════" + RESET);
-        console.log(`\n📢 Swap Event Detected: ${inputToken.symbol} → ${outputToken.symbol}`);
-        console.log(`Event Amount In: ${amountIn.toString()}`);
-
-        const MIN_ROUTING_SCORE = 20n;
-
-        if (routingScore < MIN_ROUTING_SCORE) {
-          console.log(`❌ Skipping due to routing score: ${routingScore}`);
-          continue;
-        }
-
-        console.log(`✅ Using ${inputToken.symbol}/${outputToken.symbol} with routing score: ${routingScore}`);
-
-        // ============================================================
-        // RESERVES
-        // ============================================================
-
-        const cached = reserveCache.get(pairKey);
-        if (!cached) continue;
-
-        const uRes = cached.uReserves ?? null;
-        const sRes = cached.sReserves ?? null;
-        if (!uRes || !sRes) continue;
-
-        const align = (res, inTok, outTok) => {
-          const t0 = (res.token0 ?? "").toLowerCase();
-          const t1 = (res.token1 ?? "").toLowerCase();
-
-          const inA = inTok.address.toLowerCase();
-          const outA = outTok.address.toLowerCase();
-
-          const r0 = BigInt(res.reserve0 ?? 0n);
-          const r1 = BigInt(res.reserve1 ?? 0n);
-
-          if (inA === t0 && outA === t1) return { reserveIn: r0, reserveOut: r1 };
-          if (inA === t1 && outA === t0) return { reserveIn: r1, reserveOut: r0 };
-
-          return null;
-        };
-
-        const uni = align(uRes, inputToken, outputToken);
-        const sushi = align(sRes, inputToken, outputToken);
-
-        if (!uni && !sushi) continue;
-
-        const uniIn = uni?.reserveIn ?? 0n;
-        const sushiIn = sushi?.reserveIn ?? 0n;
-
-        // ------------------------------
-        // 🔒 CONDITIONAL HARD LIQUIDITY FLOOR & IMPACT CHECK
-        // ------------------------------
-        if (networkType !== "FORK") {
-          const MIN_LIQUIDITY = 10n ** 17n; // 0.1 WETH
-          const MAX_IMPACT_BPS = 200n; // 2%
-
-          if (uniIn < MIN_LIQUIDITY || sushiIn < MIN_LIQUIDITY) {
-            console.log(`❌ Skipping shallow pool | Uni=${uniIn} Sushi=${sushiIn}`);
-            continue;
-          }
-
-          const impactUni = uniIn > 0n ? (amountIn * 10000n) / uniIn : 10_000n;
-          const impactSushi = sushiIn > 0n ? (amountIn * 10000n) / sushiIn : 10_000n;
-
-          if (impactUni > MAX_IMPACT_BPS || impactSushi > MAX_IMPACT_BPS) {
-            console.log(`❌ Skipping high impact trade | Uni=${impactUni}bps Sushi=${impactSushi}bps`);
-            continue;
-          }
-        }
-
-        // ------------------------------
-        // Now safe to compare pools or log
-        // ------------------------------
-        const reserveIn = uniIn > sushiIn ? uniIn : sushiIn;
-
-        const SCALE = 1_000_000_000n;
-        const impactScaled = (amountIn * SCALE) / reserveIn;
-        const impactPct = Number(impactScaled) / 1e7;
-
-        // ------------------------------
-        // IMPACT CLASSIFICATION (fixed sensitivity)
-        // ------------------------------
-        let signal = "NORMAL";
-
-        if (impactScaled < 10_000n) signal = "MICRO";        // <0.001%
-        else if (impactScaled < 50_000n) signal = "LOW";     // 0.001% – 0.005%
-        else if (impactScaled < 250_000n) signal = "GOOD";   // 0.005% – 0.025%
-        else if (impactScaled < 2_000_000n) signal = "HIGH"; // 0.025% – 0.2%
-        else signal = "EXTREME";                              // >0.2%
-
-        console.log(`📊 Reserve Signal → Swap Size Relative To Reserve = ${impactPct.toFixed(6)}% | Signal=${signal}`);
-        console.log(
-          `📊 IMPACT DEBUG → raw=${amountIn.toString()} ` +
-          `reserve=${reserveIn.toString()} ` +
-          `scaled=${impactScaled.toString()} ` +
-          `impact=${impactPct.toFixed(6)}% ` +
-          `signal=${signal} ` +
-          `gate=${impactScaled >= 25_000n ? "PASS" : "BLOCK"}`
-        );
-        console.log(ORANGE + "═══════════════════════════════════════════════════════════" + RESET);
-
-        if (impactScaled < 25_000n) continue;      // 0.0025%
-        if (impactScaled > 200_000_000n) continue;   // 20%
-
-        // ============================================================
-        // EXECUTION
-        // ============================================================
-
-        isExecutingTradePerPair[pairKey] = true;
-
-        try {
-          const direction = await determineDirection(
-            exchange,
-            inputToken,
-            outputToken,
-            usdcToken,
-            amountIn,
-            uFactory,
-            sFactory,
-            uRouter,
-            sRouter,
-            monitoringProvider,
-            topTokens,
-            pairLiquidityMap,
-            oneSidedPairsMap
-          );
-
-          if (!direction) continue;
-
-          const avgWethPrice = (direction.uniWethPriceUSDC + direction.sushiWethPriceUSDC) / 2;
-
-          const arbResult = await determineProfit({
-            baseToken: direction.baseToken,
-            targetToken: direction.targetToken,
-            routerPath: direction.routerPath,
-            routerNames: direction.routerNames,
-            startingReserves: direction.startingReserves,
-            endingReserves: direction.endingReserves,
-            eventAmountIn: FLASH_LOAN_SIZE,
-            networkType,
-            wethPriceInUSDC: avgWethPrice,
-            provider: executionProvider,
-            uniWethPerTokenEnd: direction.uniWethPerTokenEnd,
-            sushiWethPerTokenEnd: direction.sushiWethPerTokenEnd
-          });
-
-          if (!arbResult?.profitable || arbResult.tradeAmount <= 0n) continue;
-
-          const result = await executeTrade({
-            startOnUniswap: direction.routerPath[0] === uRouter,
-            baseToken: direction.baseToken,
-            targetToken: direction.targetToken,
-            amountBorrowed: arbResult.tradeAmount,
-            signer: refs.signer
-          });
-
-          lastTradePerPair[pairKey] = blockNumber;
-          lastExecutionTimePerPair[pairKey] = Date.now();
-
-          if (result?.hash) refs.lastSubmittedTxHash = result.hash;
-          if (result?.receipt?.status === 1n) refs.goodTradesCounter++;
-
-        } finally {
-          isExecutingTradePerPair[pairKey] = false;
-        }
-
-      } finally {
-        refs.isGlobalExecuting = false;
-
-        if (monitoringPaused && refs._swapQueue.length === 0) {
-          resumeMonitoring();
-        }
-      }
+  if (quoter) {
+    try {
+
+      // -------------------------------------------------
+      // STEP 1: WETH → LINK
+      // -------------------------------------------------
+
+      exactQuoteBuy = BigInt((await quoter.quoteExactInputSingle.staticCall(
+        flashToken.address,
+        tradeToken.address,
+        Number(buySwap.fee),
+        best.amountIn,
+        0n,
+        { blockTag: quoteBlock }
+      )).toString());
+
+      console.log(`Quoter Buy           : ${fmt(best.amountIn, flashDecimals, 6)} ${flashToken.symbol} → ${fmt(exactQuoteBuy, tradeDecimals, 6)} ${tradeToken.symbol}`);
+
+      // -------------------------------------------------
+      // STEP 2: LINK → WETH
+      // -------------------------------------------------
+
+      exactQuoteSell = BigInt((await quoter.quoteExactInputSingle.staticCall(
+        tradeToken.address,
+        flashToken.address,
+        Number(sellSwap.fee),
+        exactQuoteBuy,
+        0n,
+        { blockTag: quoteBlock }
+      )).toString());
+
+      console.log(`Quoter Sell          : ${fmt(exactQuoteBuy, tradeDecimals, 6)} ${tradeToken.symbol} → ${fmt(exactQuoteSell, flashDecimals, 6)} ${flashToken.symbol}`);
+
+      // -------------------------------------------------
+      // EXACT RESULT
+      // -------------------------------------------------
+
+      exactQuoteReturn = exactQuoteSell;
+      exactQuoteProfit = exactQuoteReturn - best.amountIn;
+
+      console.log("");
+      console.log(`Exact Quoter Return  : ${fmt(exactQuoteReturn, flashDecimals, 8)} ${flashToken.symbol}`);
+      console.log(`Exact Gross Profit   : ${exactQuoteProfit >= 0n ? "+" : ""}${fmt(exactQuoteProfit, flashDecimals, 8)} ${flashToken.symbol}`);
+
+      // -------------------------------------------------
+      // COMPARE AGAINST analyze()
+      // -------------------------------------------------
+
+      const analyzeReturnDifference = exactQuoteReturn - best.sellAmount;
+
+      console.log("");
+      console.log("COMPARE TO analyze()");
+      console.log("───────────────────────────────────────────────────────────");
+      console.log(`analyze() Return     : ${fmt(best.sellAmount, flashDecimals, 8)} ${flashToken.symbol}`);
+      console.log(`Exact Quoter Return  : ${fmt(exactQuoteReturn, flashDecimals, 8)} ${flashToken.symbol}`);
+      console.log(`Difference           : ${analyzeReturnDifference >= 0n ? "+" : ""}${fmt(analyzeReturnDifference, flashDecimals, 8)} ${flashToken.symbol}`);
+
+      // -------------------------------------------------
+      // PRICE IMPACT / EFFECTIVE RATE
+      // -------------------------------------------------
+
+      console.log("");
+      console.log("EFFECTIVE EXECUTION");
+      console.log("───────────────────────────────────────────────────────────");
+
+      const exactRate = exactQuoteReturn * PRICE_SCALE / best.amountIn;
+      const analyzeRate = best.sellAmount * PRICE_SCALE / best.amountIn;
+
+      console.log(`analyze() Return Rate: ${ethers.formatUnits(analyzeRate, 18)} ${flashToken.symbol}/${flashToken.symbol}`);
+      console.log(`Exact Return Rate    : ${ethers.formatUnits(exactRate, 18)} ${flashToken.symbol}/${flashToken.symbol}`);
+
+    } catch (e) {
+      console.log("❌ Exact WETH quoter test failed:", e.shortMessage || e.message);
     }
-
-  } finally {
-    refs._isProcessingSwapQueue = false;
+  } else {
+    console.log("⚠️ Quoter unavailable - exact quote test skipped");
   }
-}
 
-// ─────────────────────────────────────────────
-// Determine Direction based on the Event Seen
-// ─────────────────────────────────────────────
-async function determineDirection(
-  eventDex,
-  inputToken,
-  outputToken,
-  usdcToken,
-  eventAmountIn,
-  uFactory,
-  sFactory,
-  uRouter,
-  sRouter,
-  provider,
-  topTokens,
-  pairLiquidityMap,
-  oneSidedPairsMap,
-  minWethReserve = 5n * 10n ** 18n,
-  spreadThreshold = 1.0,
-  snapshot = null,
-  preFetchedReserves = null
-) {
-  try {
-    const ORANGE = "\x1b[38;5;208m";
-    const RESET = "\x1b[0m";
-    const border = () => console.log(ORANGE + "═══════════════════════════════════════════════════════════" + RESET);
+  console.log("───────────────────────────────────────────────────────────");
 
-    border();
-    console.log("🚀 Determine Direction (Flash Loan Base = WETH)");
-    border();
+  ///////////////////////////////////////////////////////
 
-    if (typeof eventAmountIn !== "bigint") eventAmountIn = BigInt(eventAmountIn.toString());
-
-    console.log(`\n📢 Swap Event Detected: ${inputToken.symbol} → ${outputToken.symbol}`);
-    console.log(`Event Amount In: ${ethers.formatUnits(eventAmountIn, Number(inputToken.decimals))}`);
-
-    const baseToken = topTokens.find(t => t.symbol === "WETH");
-    if (!baseToken) return console.log("⚠️ No WETH in pair. Skipping.");
-
-    const targetToken = inputToken.symbol === "WETH" ? outputToken : inputToken;
-    const isBaseInput = inputToken.address.toLowerCase() === baseToken.address.toLowerCase();
-
-    // ------------------- RESERVES -------------------
-    const uniPair = await getReserves(uFactory, baseToken, targetToken, provider);
-    const sushiPair = await getReserves(sFactory, baseToken, targetToken, provider);
-    if (!uniPair || !sushiPair) return console.log("❌ Missing pair data");
-
-    const uReserveBase = BigInt(uniPair.reserveA);
-    const uReserveTarget = BigInt(uniPair.reserveB);
-    const sReserveBase = BigInt(sushiPair.reserveA);
-    const sReserveTarget = BigInt(sushiPair.reserveB);
-
-    const startingReserves = { uBase: uReserveBase, uTarget: uReserveTarget, sBase: sReserveBase, sTarget: sReserveTarget };
-
-    // ------------------- WETH → USDC PRICE -------------------
-    const uUsdcRes = await getReserves(uFactory, baseToken, usdcToken, provider);
-    const sUsdcRes = await getReserves(sFactory, baseToken, usdcToken, provider);
-
-    const getWethPriceInUSDC = (res) => {
-      if (!res) return 0;
-      const wethAddr = baseToken.address.toLowerCase();
-      const wethReserve = res.token0.toLowerCase() === wethAddr ? res.reserve0 : res.reserve1;
-      const usdcReserve = res.token0.toLowerCase() === wethAddr ? res.reserve1 : res.reserve0;
-      return Number(ethers.formatUnits(usdcReserve, usdcToken.decimals)) / Number(ethers.formatEther(wethReserve));
-    };
-
-    const uniWethPriceUSDC = getWethPriceInUSDC(uUsdcRes);
-    const sushiWethPriceUSDC = getWethPriceInUSDC(sUsdcRes);
-
-    // ------------------- SIMULATE SWAP -------------------
-    function simulateSwap(reserveIn, reserveOut, amountIn) {
-      const amountInWithFee = (amountIn * 997n) / 1000n;
-      const amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
-      return { newReserveIn: reserveIn + amountIn, newReserveOut: reserveOut - amountOut };
-    }
-
-    const endingReserves = { ...startingReserves };
-    if (eventDex.toLowerCase() === "uniswap") {
-      const swap = isBaseInput ? simulateSwap(uReserveBase, uReserveTarget, eventAmountIn) : simulateSwap(uReserveTarget, uReserveBase, eventAmountIn);
-      endingReserves.uBase = isBaseInput ? swap.newReserveIn : swap.newReserveOut;
-      endingReserves.uTarget = isBaseInput ? swap.newReserveOut : swap.newReserveIn;
-    } else {
-      const swap = isBaseInput ? simulateSwap(sReserveBase, sReserveTarget, eventAmountIn) : simulateSwap(sReserveTarget, sReserveBase, eventAmountIn);
-      endingReserves.sBase = isBaseInput ? swap.newReserveIn : swap.newReserveOut;
-      endingReserves.sTarget = isBaseInput ? swap.newReserveOut : swap.newReserveIn;
-    }
-
-    // ------------------- PRICE PER TOKEN (BIGINT SAFE) -------------------
-
-    const SCALED = 10n ** BigInt(targetToken.decimals);
-
-    // WETH per TOKEN (AMM price = reserveWETH / reserveTOKEN)
-    const uniWethPerTokenStart = startingReserves.uTarget > 0n ? (startingReserves.uBase * SCALED) / startingReserves.uTarget : 0n;
-    const uniWethPerTokenEnd = endingReserves.uTarget > 0n ? (endingReserves.uBase * SCALED) / endingReserves.uTarget : 0n;
-    const sushiWethPerTokenStart = startingReserves.sTarget > 0n ? (startingReserves.sBase * SCALED) / startingReserves.sTarget : 0n;
-    const sushiWethPerTokenEnd = endingReserves.sTarget > 0n ? (endingReserves.sBase * SCALED) / endingReserves.sTarget : 0n;
-
-    const uniUsdcPerTokenStart = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenStart, targetToken.decimals)) * uniWethPriceUSDC : 0;
-    const uniUsdcPerTokenEnd = uniWethPriceUSDC ? Number(ethers.formatUnits(uniWethPerTokenEnd, targetToken.decimals)) * uniWethPriceUSDC : 0;
-    const sushiUsdcPerTokenStart = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenStart, targetToken.decimals)) * sushiWethPriceUSDC : 0;
-    const sushiUsdcPerTokenEnd = sushiWethPriceUSDC ? Number(ethers.formatUnits(sushiWethPerTokenEnd, targetToken.decimals)) * sushiWethPriceUSDC : 0;
-
-    // ------------------- SPREAD -------------------
-    const buyPrice = uniWethPerTokenEnd < sushiWethPerTokenEnd ? uniWethPerTokenEnd : sushiWethPerTokenEnd;
-    const sellPrice = uniWethPerTokenEnd > sushiWethPerTokenEnd ? uniWethPerTokenEnd : sushiWethPerTokenEnd;
-    const spreadBps = buyPrice > 0n ? ((sellPrice - buyPrice) * 10_000n) / buyPrice : 0n;
-    const pctWeth = Number(spreadBps) / 100;
-
-    // ------------------- LIQUIDITY -------------------
-    const uniLiquidity = evaluateLiquidity({ reserveBase: endingReserves.uBase, minWethReserve, dexName: "Uniswap" });
-    const sushiLiquidity = evaluateLiquidity({ reserveBase: endingReserves.sBase, minWethReserve, dexName: "Sushi" });
-    const liquidityPassed = uniLiquidity.valid && sushiLiquidity.valid;
-    const spreadPassed = Math.abs(pctWeth) >= spreadThreshold;
-
-    const uniWethReserve = getWethReserve(uniPair, baseToken.address);
-    const sushiWethReserve = getWethReserve(sushiPair, baseToken.address);
-
-    // ------------------- LOGGING (DIRECTION-AWARE HUMAN MODEL) -------------------
-
-    const toNum = (x) => Number(x);
-
-    const pricePerTokenWeth = (wethReserve, tokenReserve) => {
-      if (tokenReserve <= 0n) return 0;
-      return toNum(ethers.formatEther(wethReserve)) /
-             toNum(ethers.formatUnits(tokenReserve, targetToken.decimals));
-    };
-
-    const pricePerTokenUsdc = (wethPerToken) => wethPerToken * uniWethPriceUSDC;
-
-    const isUniAffected = eventDex.toLowerCase() === "uniswap";
-
-    // ---- UNISWAP PRICES ----
-    const uniWethBefore = pricePerTokenWeth(startingReserves.uBase, startingReserves.uTarget);
-    const uniWethAfter  = pricePerTokenWeth(endingReserves.uBase, endingReserves.uTarget);
-
-    const uniUsdcBefore = pricePerTokenUsdc(uniWethBefore);
-    const uniUsdcAfter  = pricePerTokenUsdc(uniWethAfter);
-
-    // ---- SUSHI PRICES ----
-    const sushiWethBefore = pricePerTokenWeth(startingReserves.sBase, startingReserves.sTarget);
-    const sushiWethAfter  = pricePerTokenWeth(endingReserves.sBase, endingReserves.sTarget);
-
-    const sushiUsdcBefore = pricePerTokenUsdc(sushiWethBefore);
-    const sushiUsdcAfter  = pricePerTokenUsdc(sushiWethAfter);
-
-    // ---- PCT CHANGE ----
-    const pctChange = (before, after) =>
-      before > 0 ? (((after - before) / before) * 100).toFixed(4) : "0.0000";
-
-    console.log("\n💸 Price BEFORE Swap");
-
-    console.log(`Uniswap:`);
-    console.log(`1 ${targetToken.symbol} ≈ ${uniWethBefore.toFixed(18)} WETH`);
-    console.log(`1 ${targetToken.symbol} ≈ ${uniUsdcBefore.toFixed(6)} USDC`);
-
-    console.log(`Sushi:`);
-    console.log(`1 ${targetToken.symbol} ≈ ${sushiWethBefore.toFixed(18)} WETH`);
-    console.log(`1 ${targetToken.symbol} ≈ ${sushiUsdcBefore.toFixed(6)} USDC`);
-
-    console.log("\n💸 Price AFTER Swap");
-
-    // ONLY affected DEX updates
-    if (isUniAffected) {
-      console.log(`Uniswap:`);
-      console.log(`1 ${targetToken.symbol} ≈ ${uniWethAfter.toFixed(18)} WETH`);
-      console.log(`1 ${targetToken.symbol} ≈ ${uniUsdcAfter.toFixed(6)} USDC`);
-
-      console.log(`Sushi:`);
-      console.log(`1 ${targetToken.symbol} ≈ ${sushiWethBefore.toFixed(18)} WETH`);
-      console.log(`1 ${targetToken.symbol} ≈ ${sushiUsdcBefore.toFixed(6)} USDC`);
-    } else {
-      console.log(`Uniswap:`);
-      console.log(`1 ${targetToken.symbol} ≈ ${uniWethBefore.toFixed(18)} WETH`);
-      console.log(`1 ${targetToken.symbol} ≈ ${uniUsdcBefore.toFixed(6)} USDC`);
-
-      console.log(`Sushi:`);
-      console.log(`1 ${targetToken.symbol} ≈ ${sushiWethAfter.toFixed(18)} WETH`);
-      console.log(`1 ${targetToken.symbol} ≈ ${sushiUsdcAfter.toFixed(6)} USDC`);
-    }
-
-    console.log("\n📊 Price Change");
-
-    console.log(`Uniswap Δ %: ${pctChange(uniWethBefore, uniWethAfter)}%`);
-    console.log(`Sushi Δ %:   ${pctChange(sushiWethBefore, sushiWethAfter)}%`);
-
-    console.log(`\n🔺 Direct Arb Spread: ${pctWeth.toFixed(2)}%`);
-
-    console.log("\n📈 Reserves");
-    console.log(`Uniswap WETH Reserve: ${ethers.formatEther(uniWethReserve)}`);
-    console.log(`Sushi WETH Reserve: ${ethers.formatEther(sushiWethReserve)}`);
-
-    console.log(`\n💧 Liquidity Status: ${liquidityPassed ? "Passed ✅" : "Failed ❌"}`);
-    console.log(`📊 Spread Status: ${spreadPassed ? "Passed ✅" : `Failed ❌ (${pctWeth.toFixed(2)}%)`}`);
-
-    border();
-
-    if (!liquidityPassed || !spreadPassed) return null;
-
-    // ------------------- TRADE PATH -------------------
-    const routerPath = uniWethPerTokenEnd > sushiWethPerTokenEnd ? [sRouter, uRouter] : [uRouter, sRouter];
-    const routerNames = uniWethPerTokenEnd > sushiWethPerTokenEnd ? ["Sushi", "Uniswap"] : ["Uniswap", "Sushi"];
-    console.log("\n💸 Arbitrage Trade Path:");
-    console.log(`${baseToken.symbol} → ${targetToken.symbol} → ${baseToken.symbol}`);
-    console.log(`Execution Routers: ${routerNames.join(" → ")}`);
-    border();
-
+  if (!profitable) {
     return {
-      baseToken,
-      targetToken,
-      bridgeToken: null,
-      routerPath,
-      routerNames,
-      priceDifferencePct: pctWeth,
-      startingReserves,
-      endingReserves,
-      uniWethPerTokenStart,
-      uniWethPerTokenEnd,
-      sushiWethPerTokenStart,
-      sushiWethPerTokenEnd,
-      uniUsdcPerTokenStart,
-      uniUsdcPerTokenEnd,
-      sushiUsdcPerTokenStart,
-      sushiUsdcPerTokenEnd,
-      uniWethPriceUSDC,
-      sushiWethPriceUSDC,
-      liquidityPassed,
-      spreadPassed,
-      uniWethReserve,
-      sushiWethReserve
+      profitable: false,
+      netProfit: best.netProfit
     };
-
-  } catch (err) {
-    console.error("Error determining direction:", err);
-    return null;
   }
-}
 
-// ─────────────────────────────────────────────
-// Determine profit including percentage and DEX differences
-// ─────────────────────────────────────────────
-async function determineProfit({
-  baseToken,
-  targetToken,
-  bridgeToken,
-  routerPath,               // array of Contract objects
-  routerNames,              // array of string names
-  tradePath,                // array of { inToken, outToken }
-  endingReserves,
-  networkType,
-  wethPriceInUSDC,
-  provider,
-  uniWethPerTokenEnd,       // from determineDirection
-  sushiWethPerTokenEnd,     // from determineDirection
-  maxSlippagePercent = 1n,  // 1% max % of pool allowed to trade
-  gasUsed = 150_000n,       // default gas units for estimation
-  gasPrice = 0n             // in wei
-}) {
-  try {
-    const chalk = require("chalk");
-    const orange = chalk.rgb(255, 140, 0);
-
-    console.log(orange("════════════════════════════════════════════"));
-    console.log("🚀 Determine Profit (2 Token Arbitrage)");
-    console.log(orange("════════════════════════════════════════════"));
-    console.log("Base:", baseToken.symbol);
-    console.log("Target:", targetToken.symbol, "\n");
-
-    const wethPrice = Number(wethPriceInUSDC ?? 0);
-    console.log("WETH Price (USDC):", wethPrice, "\n");
-
-    // ------------------ Ensure tradePath exists ------------------
-    if (!tradePath || !Array.isArray(tradePath) || tradePath.length === 0) {
-      tradePath = [{ inToken: baseToken, outToken: targetToken }];
-    }
-
-    // ------------------ Ensure routerPath exists ------------------
-    if (!routerPath || !Array.isArray(routerPath) || routerPath.length === 0) {
-      throw new Error(`Invalid routerPath: ${JSON.stringify(routerNames)}`);
-    }
-
-    // ------------------ GET RESERVES (TRUST DIRECTION OUTPUT) ------------------
-
-    const getReserveSet = (dex) => {
-      if (dex === "Uniswap") {
-        return {
-          in: endingReserves.uBase,
-          out: endingReserves.uTarget
-        };
-      }
-
-      if (dex === "Sushi") {
-        return {
-          in: endingReserves.sBase,
-          out: endingReserves.sTarget
-        };
-      }
-
-      throw new Error(`Unknown DEX: ${dex}`);
-    };
-
-    // 2-token or 3-token doesn't matter anymore
-    const buy = getReserveSet(routerNames[0]);
-    const sell = getReserveSet(routerNames[routerNames.length - 1]);
-
-    buyReserveIn   = buy.in;
-    buyReserveOut  = buy.out;
-
-    sellReserveIn  = sell.in;
-    sellReserveOut = sell.out;
-
-    // ------------------ Max Flash Loan & Slippage-Limited Trade ------------------
-    // Ensure flashLoanMax is BigInt (in smallest units, e.g., wei)
-    const flashLoanMax = getFlashLoanSize(networkType); 
-    console.log(
-      "Flash Loan Max:",
-      ethers.formatUnits(flashLoanMax, baseToken.decimals),
-      baseToken.symbol
-    );
-
-    // Ensure maxSlippagePercent is BigInt
-    const maxSlippageBps = maxSlippagePercent * 100n; // <-- all BigInt math
-
-    if (maxSlippageBps <= 0n) throw new Error("maxSlippagePercent must be > 0");
-
-    // Compute max trade allowed to respect slippage
-    const maxImpactTrade = (buyReserveIn * maxSlippageBps) / 10000n; // divide by 10000 bps
-    const cappedMaxTrade = flashLoanMax < maxImpactTrade ? flashLoanMax : maxImpactTrade;
-
-    // ------------------ Optimal Trade (BigInt, no helper) ------------------
-    // price ratio: sell / buy
-    // using constant product formula: x * y = k
-    // tradeSize = sqrt((buyReserveIn * sellReserveOut * 1e18) / (buyReserveOut * sellReserveIn)) - buyReserveIn
-    // simplified approximation for small trades
-
-    function getOptimalTrade(buyIn, buyOut, sellIn, sellOut, maxTrade) {
-      if (buyIn <= 0n || buyOut <= 0n || sellIn <= 0n || sellOut <= 0n) {
-        return { tradeSize: 0n, profit: 0n };
-      }
-
-      // compute rough trade size using reserves
-      // tradeSize = ((sqrt(buyIn * sellOut * 1e18 / sellIn * buyOut)) - buyIn)
-      // we'll approximate: small trades only
-      // amountOut = (trade * sellOut) / (sellIn + trade)
-      // profit = amountOut - trade
-
-      const one18 = 10n ** 18n;
-
-      // use maxTrade as starting point
-      const trade = maxTrade;
-
-      // simulate amountOut on sell DEX
-      const amountOut = (trade * sellOut) / (sellIn + trade);
-
-      // profit in base token
-      const profit = amountOut - trade;
-
-      if (profit <= 0n) {
-        return { tradeSize: 0n, profit: 0n };
-      }
-
-      return { tradeSize: trade, profit };
-    }
-
-    const { tradeSize, profit } = getOptimalTrade(
-      buyReserveIn,
-      buyReserveOut,
-      sellReserveIn,
-      sellReserveOut,
-      cappedMaxTrade
-    );
-
-    // ------------------ Final Max Trade Allowed ------------------
-    const maxTradeAllowed = tradeSize <= maxImpactTrade ? tradeSize : maxImpactTrade;
-
-    console.log(
-      "Max Trade Allowed (Slippage Cap):",
-      ethers.formatUnits(maxTradeAllowed, baseToken.decimals),
-      baseToken.symbol
-    );
-    console.log(
-      "Flash Loan Used:",
-      ethers.formatUnits(maxTradeAllowed, baseToken.decimals),
-      baseToken.symbol,
-      "\n"
-    );
-
-    if (tradeSize <= 0n || profit <= 0n) {
-      console.log("No arbitrage opportunity or profit is 0.");
-      console.log(orange("════════════════════════════════════════════"));
-      return { profitable: false, tradeAmount: 0n, profit: 0n };
-    }
-
-    // ------------------ Estimate Net Profit ------------------
-    const estimate = await estimateMaxProfit({
-      buyReserveIn,
-      buyReserveOut,
-      sellReserveIn,
-      sellReserveOut,
-      tradeSize: tradeSize,
-      gasUsed,
-      gasPrice
-    });
-
-    if (!estimate) {
-      console.log("Could not estimate profit.");
-      return { profitable: false, tradeAmount: 0n, profit: 0n };
-    }
-
-    // ------------------ PROFIT CAP ($10 min) ------------------
-    const MAX_PROFIT_USD = 5;
-
-    // convert WETH profit → USD
-    const profitInWeth = Number(ethers.formatUnits(estimate.profit, 18));
-    const profitInUsd = profitInWeth * wethPrice;
-
-    const isAboveMinProfit = profitInUsd >= MAX_PROFIT_USD;
-
-    const slippageBps = 50n; // define early
-    const wethProfit = profitInWeth;
-    const profitUSDC = wethProfit * wethPrice;
-    const roiPercent =
-      maxTradeAllowed > 0n
-        ? (wethProfit / Number(ethers.formatUnits(maxTradeAllowed, 18))) * 100
-        : 0;
-
-    // ❌ EARLY EXIT (correct)
-    if (!isAboveMinProfit) {
-      console.log("Arbitrage Profitable: NO ❌ (below $5 threshold)");
-
-      return {
-        profitable: false,
-        tradeAmount: 0n,
-        profitWETH: estimate.profit,
-        profitUSDC,
-        slippageBps
-      };
-    }
-
-    // ------------------ Compute Buy/Sell Prices ------------------
-    const buyPriceRaw  =
-      routerNames[0] === "Uniswap" ? uniWethPerTokenEnd : sushiWethPerTokenEnd;
-
-    const sellPriceRaw =
-      routerNames[1] === "Uniswap" ? uniWethPerTokenEnd : sushiWethPerTokenEnd;
-
-    const buyPrice = Number(ethers.formatUnits(buyPriceRaw, 18));
-    const sellPrice = Number(ethers.formatUnits(sellPriceRaw, 18));
-
-    // ------------------ Display ------------------
-    console.log(`Buy Price  (${routerNames[0]}):`, buyPrice.toFixed(9), baseToken.symbol);
-    console.log(`Sell Price (${routerNames[1]}):`, sellPrice.toFixed(9), baseToken.symbol, "\n");
-
-    console.log("Profit (WETH):", ethers.formatUnits(estimate.profit, baseToken.decimals));
-    console.log("Profit (USDC):", profitUSDC.toFixed(6));
-    console.log("ROI:", roiPercent.toFixed(2) + "%");
-
-    console.log(orange("════════════════════════════════════════════"));
-    console.log("Arbitrage Profitable:", "YES ✅");
-    console.log(orange("════════════════════════════════════════════"));
-
-    return {
-      profitable: true,
-      reason: "ABOVE_MIN_PROFIT_THRESHOLD",
-      tradeAmount: maxTradeAllowed,
-      profit: estimate.profit,
-      profitUsd: profitInUsd,
-      slippageBps
-    };
-
-  } catch (err) {
-    console.error("determineProfit error:", err);
-    return { profitable: false, tradeAmount: 0n, profit: 0n };
-  }
+  return {
+    profitable: true,
+    tokenIn: flashToken.address,
+    flashAmount: best.amountIn,
+    flashToken,
+    tradeToken,
+    executionRoute: [tradeCandidate.firstSwap, tradeCandidate.secondSwap],
+    netProfit: best.netProfit,
+    expectedUsdc: expectedUsdc,
+    grossProfit: best.grossProfit,
+    flashFee: best.flashFee,
+    repayment,
+    roi: bestRoi
+  };
 }
 
 // ─────────────────────────────────────────
 // EXECUTE TRADE (2-TOKEN OR TRIANGULAR)
 // ─────────────────────────────────────────
-async function executeTrade({
-  startOnUniswap,
-  baseToken,
-  targetToken,
-  amountBorrowed,
-  signer
-}) {
-  if (!signer) {
-    throw new Error("Signer is required");
-  }
+async function executeTrade(ctx, params) {
 
-  const arb = arbitrage.connect(signer);
+    const { signer, arbitrageContract, minProfit, executionProvider: provider, quoter} = ctx;
+    const { tokenIn, flashAmount, executionRoute, netProfit, flashToken, expectedUsdc} = params;
 
-  try {
-    // ---------------- ORANGE BORDER ----------------
-    const now = new Date();
-    const timestamp = now.toLocaleString("en-US", { hour12: true });
+    const fmt = (value, decimals, digits = 4) => Number(ethers.formatUnits(value, decimals)).toFixed(digits);
+    const USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
+    const USDC_DECIMALS = 6;
 
-    console.log(orange("═══════════════════════════════════════════════════════════"));
-    console.log(orange("🚀 Executing Trade (Flash Loan Arbitrage)"));
-    console.log(orange("═══════════════════════════════════════════════════════════"));
+    const ORANGE = "\x1b[38;5;208m";
+    const RESET = "\x1b[0m";
 
-    console.log(`🕒 Timestamp: ${timestamp}`);
-    console.log("🚀 Executing Arbitrage Trade");
-    console.log(`Borrowing Amount: ${ethers.formatUnits(amountBorrowed, baseToken.decimals)} ${baseToken.symbol}`);
-    console.log(`Start On Uniswap: ${startOnUniswap}`);
+    const border = () => console.log(ORANGE + "═══════════════════════════════════════════════════════════" + RESET);
 
-    if (PROJECT_SETTINGS.SIMULATE_TRADES) {
-      if (PROJECT_SETTINGS.isLocal) {
-        // Simulate on local/forked network (perform all steps as if it's a real trade)
-        console.log("⚠️ Simulating trade on local network... Performing all steps as if it were real.");
-        // Simulate the trade here
-        console.log("🧱 Block number (simulation): 24548821"); // Example block number
-        console.log("✅ Simulated trade completed on local network.");
-        console.log(orange("═══════════════════════════════════════════════════════════"));
-        return {
-          hash: null, // No transaction hash in simulation
-          receipt: null // No receipt in simulation
-        };
-      } else {
-        // Simulate on live network (do not broadcast)
-        console.log("⚠️ Simulating trade... No real transaction will be sent.");
-        console.log("✅ Simulated trade completed on live network.");
-        console.log(orange("═══════════════════════════════════════════════════════════"));
-        return {
-          hash: null, // No transaction hash
-          receipt: null // No receipt
-        };
-      }
-    }
-
-    // If not in simulation mode, execute the real trade
-    const tx = await arb.executeTrade(
-      startOnUniswap,
-      baseToken.address,
-      targetToken.address,
-      ethers.ZeroAddress,
-      amountBorrowed, 
-      slippageBps
-    );
-
-    console.log(`📨 Transaction sent: ${tx.hash}`);
-
-    // Wait for receipt (real trade)
-    const receipt = await tx.wait();
-
-    if (receipt.status !== 1) {
-      throw new Error("Transaction reverted on-chain");
-    }
-
-    console.log(`✅ Trade mined in block: ${receipt.blockNumber}`);
-    console.log(orange("═══════════════════════════════════════════════════════════\n"));
-
-    return {
-      hash: tx.hash,
-      receipt
+    const addr = v => {
+        if (!v) return;
+        if (typeof v === "string") return v;
+        return v.address ?? v.token ?? v.tokenIn;
     };
-  } catch (err) {
-    console.error(orange("❌ Trade execution failed:"), err);
-    throw err;
-  }
+
+    const norm = (v, label="unknown") => {
+        const a = addr(v);
+        if (!a) throw new Error(`Missing address for ${label}`);
+        return a.toLowerCase();
+    };
+
+    try {
+
+        border();
+        console.log("🚀 EXECUTE TRADE");
+        border();
+
+        if (!tokenIn) throw new Error("Missing tokenIn");
+        if (!flashAmount) throw new Error("Missing flashAmount");
+        if (!Array.isArray(executionRoute)) throw new Error("Invalid route");
+        if (executionRoute.length < 2) throw new Error("Route requires 2 swaps");
+        if (!signer) throw new Error("Missing signer");
+        if (!arbitrageContract) throw new Error("Missing contract");
+
+        console.log("📍 ROUTE");
+
+        executionRoute.forEach((s,i)=> console.log(`${i}: ${s.tokenIn.symbol} → ${s.tokenOut.symbol} (${s.fee})`));
+
+        const path = executionRoute.map((s,i)=> norm(s.tokenIn,`route ${i} input`));
+        path.push(norm(executionRoute.at(-1).tokenOut, "route final output"));
+
+        if (path[0] !== path.at(-1))throw new Error(`Invalid circular route ${path[0]} → ${path.at(-1)}`);
+
+        if (ctx.debug)
+            console.log("🔍 Route:",path[0],"→",path.at(-1));
+
+        const cleanRoute = executionRoute.map((s,i)=>({dex:0, tokenIn:norm(s.tokenIn,`route ${i} input`), tokenOut:norm(s.tokenOut,`route ${i} output`), fee:s.fee}));
+
+        console.log(`\n🛣 Route built (${cleanRoute.length} hops)`);
+
+        const arb = arbitrageContract.connect(signer);
+
+        console.log("\n🧪 Simulating transaction...");
+
+        try {
+
+            const gasEstimate = await arb.executeTrade.estimateGas(tokenIn, flashAmount, cleanRoute, minProfit);
+            console.log("Estimated gas:",gasEstimate.toString());
+            console.log("✅ Simulation passed");
+
+        } catch(e) {
+            console.error("❌ Simulation failed");
+            console.error(e.reason ?? e.shortMessage ?? e.message);
+            throw e;
+
+        }
+
+        console.log("\n📨 Sending transaction...");
+
+        const tx = await arb.executeTrade(tokenIn, flashAmount, cleanRoute, minProfit);
+
+        if(ctx.refs){
+            ctx.refs.lastSubmittedTxHash = tx.hash.toLowerCase();
+            ctx.refs.lastTradeTime = Date.now();
+        }
+
+        console.log("TX Hash:",tx.hash);
+
+        const receipt = await tx.wait();
+
+        if(ctx.refs){ctx.refs.lastTradeBlock = receipt.blockNumber}
+
+        console.log("\n========== RECEIPT ==========");
+        console.log("Status:", receipt.status);
+        console.log("Gas used:", receipt.gasUsed.toString());
+
+        if(!receipt || receipt.status !== 1) throw new Error("Transaction reverted");
+
+        // =====================================================
+        // PROFIT RESULT
+        // =====================================================
+
+        console.log("📊 PROFIT RESULT");
+
+        const profitDecimals = flashToken.decimals ?? 18;
+
+        // -----------------------------------------------------
+        // FIND REALIZED PROFIT EVENT
+        // -----------------------------------------------------
+
+        let realizedProfit = null;
+
+        for (const log of receipt.logs) {
+            try {
+                const parsed = arbitrageContract.interface.parseLog(log);
+
+                if (parsed?.name === "Profit") {
+                    realizedProfit = BigInt(parsed.args[0].toString());
+                    break;
+                }
+            } catch {}
+        }
+
+        // -----------------------------------------------------
+        // ACTUAL GAS COST
+        // -----------------------------------------------------
+
+        let actualGasCost = null;
+
+        if (receipt.gasPrice != null) {
+            actualGasCost = receipt.gasUsed * receipt.gasPrice;
+        }
+
+        // -----------------------------------------------------
+        // REALIZED NET PROFIT
+        // -----------------------------------------------------
+
+        let realizedNetProfit = null;
+        let realizedUsdc = null;
+
+        if (realizedProfit !== null) {
+
+            realizedNetProfit = actualGasCost !== null ? realizedProfit - actualGasCost : realizedProfit;
+
+            // -------------------------------------------------
+            // REALIZED NET PROFIT → USDC
+            // -------------------------------------------------
+
+            if (quoter && realizedNetProfit > 0n) {
+                try {
+                    realizedUsdc = BigInt(
+                        (
+                            await quoter.quoteExactInputSingle.staticCall(
+                                flashToken.address,
+                                USDC,
+                                500,
+                                realizedNetProfit,
+                                0n
+                            )
+                        ).toString()
+                    );
+                } catch (e) {
+                    console.log(`  ⚠️ USDC quote failed - ${e.shortMessage || e.message}`);
+                }
+            }
+        }
+
+        // -----------------------------------------------------
+        // EXPECTED
+        // -----------------------------------------------------
+
+        console.log("\nExpected:");
+        console.log(`  Net Profit       : +${fmt(netProfit, profitDecimals)} ${flashToken.symbol}`);
+        console.log(`  USDC Value       : ${expectedUsdc != null ? `+$${fmt(expectedUsdc, USDC_DECIMALS, 2)}` : "N/A"}`);
+
+        // -----------------------------------------------------
+        // REALIZED
+        // -----------------------------------------------------
+
+        if (realizedNetProfit !== null) {
+
+            console.log("\nRealized:");
+            console.log(`  Gross Profit     : +${fmt(realizedProfit, profitDecimals)} ${flashToken.symbol}`);
+            console.log(`  Actual Gas Cost  : -${fmt(actualGasCost ?? 0n, profitDecimals)} ${flashToken.symbol}`);
+            console.log(`  Net Profit       : +${fmt(realizedNetProfit, profitDecimals)} ${flashToken.symbol}`);
+            console.log(`  USDC Value       : ${realizedUsdc != null ? `+$${fmt(realizedUsdc, USDC_DECIMALS, 2)}` : "N/A"}`);
+
+            // -------------------------------------------------
+            // DIFFERENCE
+            // -------------------------------------------------
+
+            const profitDifference = realizedNetProfit - netProfit;
+            const usdcDifference = expectedUsdc != null && realizedUsdc != null ? realizedUsdc - expectedUsdc : null;
+
+            console.log("\nDifference between Expected and Realized Profit:");
+            console.log(`  WETH : ${profitDifference >= 0n ? "+" : ""}${fmt(profitDifference, profitDecimals)} ${flashToken.symbol}`);
+            console.log(`  USDC : ${usdcDifference != null ? `${usdcDifference >= 0n ? "+" : ""}$${fmt(usdcDifference, USDC_DECIMALS, 2)}` : "N/A"}`);
+
+        } else {
+
+            console.log("\nRealized:");
+            console.log("  ⚠️ Profit event not found");
+        }
+
+        if(ctx.debugEvents){
+            for(const log of receipt.logs){
+                try{
+                    const parsed = arbitrageContract.interface.parseLog(log);
+                    console.log("EVENT:", parsed.name, parsed.args);
+                }catch{}
+            }
+        }
+
+        console.log("==============================\n");
+
+        if(!receipt || receipt.status !== 1)
+            throw new Error("Transaction reverted");
+
+        border();
+        console.log("✅ EXECUTE TRADE COMPLETE");
+        border();
+
+        return {
+            hash:tx.hash,
+            receipt
+        };
+
+    } catch(err) {
+
+        console.error("\n❌ EXECUTE TRADE ERROR");
+        console.error(err);
+        throw err;
+    }
 }
 
 // ─────────────────────────────────────────
@@ -1746,4 +1993,4 @@ async function executeTrade({
 // ─────────────────────────────────────────
 main().catch(console.error);
 
-// Works !! Both Pump and Dump tests work. Works on Mainnet too it seems. 
+// !! Swapping over to a 1 Dex bot now!! Made changes to analzye, all working now with Quoter, changing CheckProfit now!!

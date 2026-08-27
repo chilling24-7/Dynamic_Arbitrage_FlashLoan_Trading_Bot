@@ -1,281 +1,448 @@
-/**
- * Generic Token Pump/Dump Test (Multi-Token, Accurate ROI)
- * Ethers v6 + BigInt safe
- */
-
 const hre = require("hardhat");
-const { ethers, network } = hre;
+const { ethers } = hre;
 
-// ===== Constants =====
-const UNI_ROUTER = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".toLowerCase();
-const FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".toLowerCase();
-const WETH = "0xC02aaA39b223FE8D0A0e5c4f27eAD9083C756Cc2".toLowerCase();
-const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".toLowerCase();
-const PRECISION = 10n ** 18n;
 
-// ===== Router registry =====
-const ROUTERS = { [UNI_ROUTER]: "Uniswap V2" };
+// =====================================================
+// CONFIG
+// =====================================================
 
-// ===== Token config =====
-const TOKEN_CONFIG = {
-  LINK: {
+const CONFIG = {
+  TOKEN: {
     symbol: "LINK",
-    address: "0x514910771af9ca656af840dff83e8264ecf986ca".toLowerCase(),
-    whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase()
+    address: "0xf97f4df75117a78c1a5a0dbb814af92458539fb4",
   },
-  LDO: {
-    symbol: "LDO",
-    address: "0x5a98fcbea516cf06857215779fd812ca3bef1b32".toLowerCase(),
-    whale: "0xF977814e90dA44bFA03b6295A0616a897441aceC".toLowerCase()
+
+  WETH: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+
+  V3: {
+    QUOTER: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6",
+    ROUTER: "0xE592427A0AEce92De3Edee1F18E0157C05861564",
   },
-  AAVE: {
-    symbol: "AAVE",
-    address: "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9".toLowerCase(),
-    whale: "0x25f2226b597e8f9514b3f68f00f494cf4f286491".toLowerCase()
-  },
-  SHIB: {
-    symbol: "SHIB",
-    address: "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE".toLowerCase(),
-    whale: "0x28C6c06298d514Db089934071355E5743bf21d60".toLowerCase()
-  }
+
+  FEES: [500, 3000, 10000],
+  PUMP_WETH: "100",
 };
 
-// ===== Token symbols =====
-const TOKEN_SYMBOLS = {
-  [WETH]: "WETH",
-  [USDC]: "USDC",
-  ...Object.fromEntries(Object.values(TOKEN_CONFIG).map(t => [t.address, t.symbol]))
-};
 
-// ===== Swap settings =====
-// Increased liquidity to ensure bot executes
-const liquidityTokens = "500000"; // 500k tokens
-const swapTokens = "10000";       // 10k tokens for swap
-const wethLiquidity = "1000";     // 1000 WETH
+// =====================================================
+// ABIS
+// =====================================================
 
-// ===== ABIs =====
 const ERC20_ABI = [
-  "function balanceOf(address) view returns(uint256)",
-  "function approve(address,uint256) returns(bool)",
-  "function allowance(address,address) view returns(uint256)",
-  "function decimals() view returns(uint8)",
-  "function deposit() payable"
+  "function decimals() view returns (uint8)",
+  "function deposit() payable",
+  "function approve(address,uint256) returns (bool)",
 ];
-const FACTORY_ABI = ["function getPair(address,address) view returns(address)"];
-const PAIR_ABI = [
-  "function getReserves() view returns(uint112,uint112,uint32)",
-  "function token0() view returns(address)"
+
+
+const QUOTER_ABI = [
+  "function quoteExactInputSingle(address,address,uint24,uint256,uint160) returns (uint256)"
 ];
+
+
 const ROUTER_ABI = [
-  "function swapExactTokensForTokens(uint,uint,address[],address,uint) returns(uint[])",
-  "function addLiquidity(address,address,uint,uint,uint,uint,address,uint)"
+  "function exactInputSingle(tuple(address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) returns (uint256)"
 ];
 
-// ===== Helpers =====
-function resolveSymbol(address) {
-  return TOKEN_SYMBOLS[address.toLowerCase()] || address.slice(0, 6);
-}
-function resolveRouterName(address) {
-  return ROUTERS[address.toLowerCase()] || "Unknown Router";
-}
-function formatPath(path) {
-  return path.map(resolveSymbol).join(" → ");
-}
-function computePrice(reserveOut, reserveIn) {
-  return (reserveOut * PRECISION) / reserveIn;
-}
-function toFloat(priceBigInt) {
-  return Number(priceBigInt) / 1e18;
-}
-function percentChange(before, after) {
-  return Number(((after - before) * 10000n) / before) / 100;
-}
 
-// ===== Display =====
-const ORANGE = "\x1b[38;5;208m";
-const RESET = "\x1b[0m";
+// =====================================================
+// HELPERS
+// =====================================================
 
-function displayResult({
-  tokenSymbol,
-  priceBefore,
-  priceAfter,
-  priceBeforeUSDC,
-  priceAfterUSDC,
-  percent,
-  tokenReserveAfter,
-  wethReserveAfter,
-  tokenDecimals,
-  routerAddress,
-  routerPath,
-  profitWETH,
-  profitUSDC,
-  roi
-}) {
-  console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
-  console.log(`💰 Token: ${tokenSymbol}`);
-  console.log(`🔹 Liquidity Pool: ${tokenSymbol}/WETH`);
-  console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
+const section = (x) => {
+  console.log("\n═══════════════════════════════");
+  console.log(x);
+  console.log("═══════════════════════════════");
+};
 
-  console.log("\n💸 Price BEFORE Swap");
-  console.log(`1 ${tokenSymbol} ≈ ${toFloat(priceBefore)} WETH`);
-  console.log(`1 ${tokenSymbol} ≈ ${priceBeforeUSDC.toFixed(6)} USDC`);
 
-  console.log("\n💸 Price AFTER Swap");
-  console.log(`1 ${tokenSymbol} ≈ ${toFloat(priceAfter)} WETH`);
-  console.log(`1 ${tokenSymbol} ≈ ${priceAfterUSDC.toFixed(6)} USDC`);
+const pct = (before, after) => {
 
-  console.log("\n📊 Price Change");
-  console.log(`Δ %: ${percent.toFixed(4)}%`);
+  if (before === 0n) return 0;
 
-  console.log("\n🧭 Router");
-  console.log(resolveRouterName(routerAddress));
+  return Number(
+    ((after - before) * 10000n) / before
+  ) / 100;
 
-  console.log("\n🔀 Path");
-  console.log(formatPath(routerPath));
+};
 
-  console.log("\n📈 Reserves");
-  console.log(`${tokenSymbol}: ${ethers.formatUnits(tokenReserveAfter, tokenDecimals)}`);
-  console.log(`WETH: ${ethers.formatEther(wethReserveAfter)}`);
 
-  console.log("\n🚀 Estimated Swap Profit / ROI:");
-  console.log(`Profit (WETH): ${profitWETH.toFixed(6)}`);
-  console.log(`Profit (USDC): ${profitUSDC.toFixed(2)}`);
-  console.log(`ROI: ${roi.toFixed(4)} %`);
+const price = (out, inAmt) => {
 
-  console.log(ORANGE + "══════════════════════════════════════════════════════════" + RESET);
-}
+  if (inAmt === 0n) return 0n;
 
-// ===== Main Test =====
-async function runGenericTest(symbol) {
-  const config = TOKEN_CONFIG[symbol];
-  const whale = config.whale;
+  return (out * 10n ** 18n) / inAmt;
 
-  console.log(`\n🧪 Testing ${symbol} with whale ${whale}\n`);
+};
 
-  await network.provider.request({ method: "hardhat_impersonateAccount", params: [whale] });
-  await network.provider.request({ method: "hardhat_setBalance", params: [whale, "0x1000000000000000000000"] });
 
-  const signer = await ethers.getSigner(whale);
-  const token = await ethers.getContractAt(ERC20_ABI, config.address);
-  const weth = await ethers.getContractAt(ERC20_ABI, WETH);
-  const usdc = await ethers.getContractAt(ERC20_ABI, USDC);
+const fmt = (x) => Number(x) / 1e18;
 
-  const tokenDecimals = await token.decimals();
-  const usdcDecimals = await usdc.decimals();
 
-  const liquidityTokenBN = ethers.parseUnits(liquidityTokens, tokenDecimals);
-  const swapTokenBN = ethers.parseUnits(swapTokens, tokenDecimals);
-  const wethLiquidityBN = ethers.parseEther(wethLiquidity);
 
-  const whaleBalance = await token.balanceOf(whale);
-  console.log(`💰 Whale Balance: ${ethers.formatUnits(whaleBalance, tokenDecimals)} ${symbol}`);
-  if (BigInt(whaleBalance) < swapTokenBN) throw new Error("Whale lacks tokens for swap");
+// =====================================================
+// MAIN
+// =====================================================
 
-  const router = await ethers.getContractAt(ROUTER_ABI, UNI_ROUTER);
-  const factory = await ethers.getContractAt(FACTORY_ABI, FACTORY);
+async function main() {
 
-  // Approvals
-  const tokenAllowance = await token.allowance(whale, UNI_ROUTER);
-  if (BigInt(tokenAllowance) < liquidityTokenBN + swapTokenBN)
-    await token.connect(signer).approve(UNI_ROUTER, ethers.MaxUint256);
 
-  const wethAllowance = await weth.allowance(whale, UNI_ROUTER);
-  if (BigInt(wethAllowance) < wethLiquidityBN)
-    await weth.connect(signer).approve(UNI_ROUTER, ethers.MaxUint256);
+  // =====================================================
+  // SNAPSHOT ORIGINAL POOL STATE
+  // =====================================================
 
-  // Get Pair & reserves
-  const pairAddress = await factory.getPair(config.address, WETH);
-  const pair = await ethers.getContractAt(PAIR_ABI, pairAddress);
-  const token0 = await pair.token0();
-  let [r0, r1] = await pair.getReserves();
-  let [tokenReserve, wethReserve] = token0.toLowerCase() === config.address ? [r0, r1] : [r1, r0];
+  const snapshot =
+    await ethers.provider.send("evm_snapshot");
 
-  console.log(`🔹 Initial Reserves - ${symbol}: ${ethers.formatUnits(tokenReserve, tokenDecimals)}, WETH: ${ethers.formatEther(wethReserve)}`);
 
-  // ===== FORCE liquidity addition =====
-  console.log("💧 FORCING Liquidity Addition...");
-  await weth.connect(signer).deposit({ value: wethLiquidityBN });
-  await router.connect(signer).addLiquidity(
-    config.address,
-    WETH,
-    liquidityTokenBN,
-    wethLiquidityBN,
-    0n,
-    0n,
-    whale,
-    BigInt(Math.floor(Date.now() / 1000) + 600)
-  );
-  console.log("✅ Liquidity Added");
-
-  // Refresh reserves after liquidity
-  [r0, r1] = await pair.getReserves();
-  [tokenReserve, wethReserve] = token0.toLowerCase() === config.address ? [r0, r1] : [r1, r0];
-
-  console.log(`🔹 Reserves AFTER Liquidity - ${symbol}: ${ethers.formatUnits(tokenReserve, tokenDecimals)}, WETH: ${ethers.formatEther(wethReserve)}`);
-
-  // WETH/USDC price
-  const wuPairAddr = await factory.getPair(WETH, USDC);
-  const wuPair = await ethers.getContractAt(PAIR_ABI, wuPairAddr);
-  const token0wu = await wuPair.token0();
-  const [wu0, wu1] = await wuPair.getReserves();
-  const [wethRes, usdcRes] = token0wu.toLowerCase() === WETH ? [wu0, wu1] : [wu1, wu0];
-  const wethPriceUSDC = Number(ethers.formatUnits(usdcRes, usdcDecimals)) / Number(ethers.formatEther(wethRes));
-
-  const priceBefore = computePrice(wethReserve, tokenReserve);
-  const priceBeforeUSDC = toFloat(priceBefore) * wethPriceUSDC;
-
-  // Swap calculation
-  console.log(`🔄 Swapping ${swapTokens} ${symbol}`);
-  const swapPath = [config.address, WETH];
-  const amountInWithFee = swapTokenBN * 997n / 1000n;
-  const numerator = amountInWithFee * wethReserve;
-  const denominator = tokenReserve + amountInWithFee;
-  const wethOutBN = numerator / denominator;
-
-  await router.connect(signer).swapExactTokensForTokens(
-    swapTokenBN,
-    0n,
-    swapPath,
-    whale,
-    BigInt(Math.floor(Date.now() / 1000) + 600)
+  console.log(
+    "Snapshot created:",
+    snapshot
   );
 
-  // Reserves after swap
-  [r0, r1] = await pair.getReserves();
-  [tokenReserve, wethReserve] = token0.toLowerCase() === config.address ? [r0, r1] : [r1, r0];
 
-  const priceAfter = computePrice(wethReserve, tokenReserve);
-  const priceAfterUSDC = toFloat(priceAfter) * wethPriceUSDC;
-  const pct = percentChange(priceBefore, priceAfter);
 
-  // Realized profit
-  const profitWETH = Number(ethers.formatEther(wethOutBN)) - (Number(ethers.formatUnits(swapTokenBN, tokenDecimals)) * toFloat(priceBefore));
-  const profitUSDC = profitWETH * wethPriceUSDC;
-  const roi = (profitWETH / (Number(ethers.formatUnits(swapTokenBN, tokenDecimals)) * toFloat(priceBefore))) * 100;
+  try {
 
-  displayResult({
-    tokenSymbol: symbol,
-    priceBefore,
-    priceAfter,
-    priceBeforeUSDC,
-    priceAfterUSDC,
-    percent: pct,
-    tokenReserveAfter: tokenReserve,
-    wethReserveAfter: wethReserve,
-    tokenDecimals,
-    routerAddress: UNI_ROUTER,
-    routerPath: swapPath,
-    profitWETH,
-    profitUSDC,
-    roi
-  });
+
+    const [trader] =
+      await ethers.getSigners();
+
+
+
+    section(`🧪 V3 PUMP EVENT ${CONFIG.TOKEN.symbol}`);
+
+
+
+    const amountIn =
+      ethers.parseEther(CONFIG.PUMP_WETH);
+
+
+
+    console.log(
+      "Trader:",
+      trader.address
+    );
+
+
+    console.log(
+      "Pump:",
+      ethers.formatEther(amountIn),
+      "WETH"
+    );
+
+
+
+    const weth =
+      await ethers.getContractAt(
+        ERC20_ABI,
+        CONFIG.WETH
+      );
+
+
+    const token =
+      await ethers.getContractAt(
+        ERC20_ABI,
+        CONFIG.TOKEN.address
+      );
+
+
+    const quoter =
+      await ethers.getContractAt(
+        QUOTER_ABI,
+        CONFIG.V3.QUOTER
+      );
+
+
+    const router =
+      await ethers.getContractAt(
+        ROUTER_ABI,
+        CONFIG.V3.ROUTER,
+        trader
+      );
+
+
+
+    const tokenDecimals =
+      await token.decimals();
+
+
+
+
+    // =====================================================
+    // WRAP
+    // =====================================================
+
+    await weth.deposit({
+      value: amountIn
+    });
+
+
+    console.log("Wrapped");
+
+
+
+
+    // =====================================================
+    // FIND BEST ROUTE
+    // =====================================================
+
+    console.log("\nChecking fee tiers");
+
+
+    let bestFee = null;
+    let bestOut = 0n;
+
+
+
+    for (const fee of CONFIG.FEES) {
+
+      try {
+
+        const out =
+          await quoter.quoteExactInputSingle.staticCall(
+            CONFIG.WETH,
+            CONFIG.TOKEN.address,
+            fee,
+            amountIn,
+            0
+          );
+
+
+        console.log(
+          fee,
+          ethers.formatUnits(
+            out,
+            tokenDecimals
+          ),
+          CONFIG.TOKEN.symbol
+        );
+
+
+
+        if (out > bestOut) {
+
+          bestOut = out;
+          bestFee = fee;
+
+        }
+
+
+      } catch {}
+
+    }
+
+
+
+    if (!bestFee || bestOut === 0n) {
+      throw new Error("No valid pool");
+    }
+
+
+
+    console.log(
+      "\nSelected fee:",
+      bestFee
+    );
+
+
+
+
+    // =====================================================
+    // BEFORE
+    // =====================================================
+
+    const priceBeforeRaw =
+      price(
+        bestOut,
+        amountIn
+      );
+
+
+
+    console.log("\n💲 EXECUTION PRICE (BEFORE)");
+
+    console.log(
+      `1 WETH ≈ ${fmt(priceBeforeRaw)} ${CONFIG.TOKEN.symbol}`
+    );
+
+
+
+
+    // =====================================================
+    // APPROVE
+    // =====================================================
+
+    await weth.approve(
+      CONFIG.V3.ROUTER,
+      amountIn
+    );
+
+
+
+
+    // =====================================================
+    // SWAP EVENT
+    // =====================================================
+
+    section("🚀 Creating swap event");
+
+
+
+    const tx =
+      await router.exactInputSingle({
+
+        tokenIn: CONFIG.WETH,
+
+        tokenOut: CONFIG.TOKEN.address,
+
+        fee: bestFee,
+
+        recipient: trader.address,
+
+        deadline:
+          BigInt(
+            Math.floor(Date.now() / 1000) + 600
+          ),
+
+        amountIn,
+
+        amountOutMinimum: 0n,
+
+        sqrtPriceLimitX96: 0n
+
+      });
+
+
+
+    const receipt =
+      await tx.wait();
+
+
+
+    console.log(
+      "TX:",
+      receipt.hash
+    );
+
+
+    console.log(
+      "Block:",
+      receipt.blockNumber
+    );
+
+
+    console.log(
+      "Logs:",
+      receipt.logs.length
+    );
+
+
+
+    // =====================================================
+    // WAIT FOR BOT
+    // =====================================================
+
+    console.log(
+      "Waiting 5000ms for bot..."
+    );
+
+
+    await new Promise(resolve =>
+      setTimeout(resolve, 5000)
+    );
+
+    // =====================================================
+    // AFTER
+    // =====================================================
+
+    const postOut =
+      await quoter.quoteExactInputSingle.staticCall(
+        CONFIG.WETH,
+        CONFIG.TOKEN.address,
+        bestFee,
+        amountIn,
+        0
+      );
+
+    const priceAfterRaw =
+      price(
+        postOut,
+        amountIn
+      );
+
+    console.log("\n💲 EXECUTION PRICE (AFTER)");
+
+    console.log(
+      `1 WETH ≈ ${fmt(priceAfterRaw)} ${CONFIG.TOKEN.symbol}`
+    );
+
+    const move =
+      pct(
+        priceBeforeRaw,
+        priceAfterRaw
+      );
+
+    console.log("\n📊 PRICE MOVEMENT");
+
+    console.log(
+      move.toFixed(6),
+      "%"
+    );
+
+    section("✅ BOT EVENT CREATED");
+
+    console.log(
+      "Direction:",
+      "WETH →",
+      CONFIG.TOKEN.symbol
+    );
+
+    console.log(
+      "AmountIn:",
+      ethers.formatEther(amountIn),
+      "WETH"
+    );
+
+    console.log(
+      "Fee:",
+      bestFee
+    );
+
+    console.log("\n📊 SIGNAL DATA");
+
+    console.log(
+      "PrePrice :",
+      fmt(priceBeforeRaw)
+    );
+
+    console.log(
+      "PostPrice:",
+      fmt(priceAfterRaw)
+    );
+
+    console.log(
+      "Move     :",
+      move.toFixed(6),
+      "%"
+    );
+  } finally {
+
+
+    // =====================================================
+    // RESTORE POOL STATE
+    // =====================================================
+
+    const reverted =
+      await ethers.provider.send(
+        "evm_revert",
+        [snapshot]
+      );
+
+    console.log(
+      "\nPool state restored:",
+      reverted
+    );
+  }
 }
-
-// ===== Run test =====
-runGenericTest("LINK").catch(console.error);
-
-
-// runGenericTest("SHIB")
-// runGenericTest("LINK")
-// runGenericTest("AAVE")
-// runGenericTest("LINK")
+main().catch(console.error);
