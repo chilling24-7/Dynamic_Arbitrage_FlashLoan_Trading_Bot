@@ -156,48 +156,96 @@ With the way the world is going, I wanted to share what I did and show what I ha
 
 ## Setting Up a new Project
 ### 1. Clone/Download the Repository
+git clone https://github.com/chilling24-7/Dynamic_Arbitrage_FlashLoan_Trading_Bot.git
 
 ### 2. Install Dependencies:
 
+Start a new project:
+- npx hardhat --init
+
+Start hardhat v2 (older version)
+
 Install HardHat version 2:
-npm install --save-dev hardhat@^2.0.0
+- npm install --save-dev hardhat@^2.0.0
 
 Install a Specific version 2:
-npm install --save-dev hardhat@2.10.0 
+- npm install --save-dev hardhat@2.10.0 
 
 Install NVM:
-nvm install 22.10.0
-nvm use 22
-
-Install Node v18:
-npm install 18
-npm use 18
-
-npx hardhat compile (should work) 
+- nvm install 22.10.0
+- nvm use 22
 
 Then install ethers:
-npm install ethers@6
+- npm install ethers@6
 
-Then install this:
-npm install --save-dev @nomicfoundation/hardhat-ethers
+npx hardhat compile (should work) 
+Will need to create a .env file with the needed variables. 
+
+Then install may be needed, but have worked without doing it:
+- npm install --save-dev @nomicfoundation/hardhat-ethers
+
+List of other dependencies that are needed:
+- npm install --save-dev \
+	@openzeppelin/contracts@4.9.6 \
+	@uniswap/v2-core@1.0.1 \
+	@uniswap/v2-periphery@1.1.0-beta.0 \
+	@balancer-labs/v2-interfaces@0.4.0 \
+	@nomicfoundation/hardhat-toolbox@6.1.2 \
+	hardhat@2.28.6
+
+Optional if you want to try making the bot be a backrunner: 
 
 Then install this to allow backrunner bundles:
-npm install @flashbots/ethers-provider-bundle or yarn add @flashbots/ethers-provider-bundle or npm install ethers@6 @flashbots/ethers-provider-bundle
+- npm install @flashbots/ethers-provider-bundle or yarn add @flashbots/ethers-provider-bundle or npm install ethers@6 @flashbots/ethers-provider-bundle
 
 To remove or uninstall:
-npm uninstall @flashbots/ethers-provider-bundle (if you need to remove it)
+- npm uninstall @flashbots/ethers-provider-bundle (if you need to remove it)
 
 ### 3. Create and Setup .env
 Before running any scripts, you'll want to create a .env file with the following values (see .env.example):
 
-- **ALCHEMY_API_KEY=""**
-- **ARB_FOR="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"** (By default we are using WETH)
-- **ARB_AGAINST="0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE"** (By default we are using SHIB)
-- **PRIVATE_KEY=""** (Private key of the account to recieve profit/execute arbitrage contract)
-- **PRICE_DIFFERENCE=0.50** (Difference in price between Uniswap & Sushiswap, default is 0.50%)
-- **UNITS=0** (Only used for price reporting)
-- **GAS_LIMIT=400000** (Currently a hardcoded value, may need to adjust during testing)
-- **GAS_PRICE=0.00000006** (60 Gwei, Currently a hardcoded value, may need to adjust during testing)
+# Tokens to arbitrage
+ARB_FOR=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2   # WETH
+ARB_AGAINST=0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32  # LDO
+#ARB_AGAINST=0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE  # SHIB
+ARB_THIRD=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+
+# Needed Variables
+USDC=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+USDT=0xdAC17F958D2ee523a2206206994597C13D831ec7
+WETH=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+DAI=0x6B175474E89094C44Da98b954EedeAC495271d0F
+
+WETH_ADDRESS=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+DAI_ADDRESS=0x6B175474E89094C44Da98b954EedeAC495271d0F
+VAULT_ADDRESS=0xBA12222222228d8Ba445958a75a0704d566BF2C8
+
+# Router Variables
+SUSHI_ROUTER=0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F
+UNI_ROUTER=0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+
+# Minimum Profit limit
+MIN_PROFIT_USDC=5
+
+# Price difference threshold (%) for executing arbitrage
+PRICE_DIFFERENCE=0.50
+
+# Number of decimals to display for prices
+UNITS=15
+
+# Gas configuration
+GAS_LIMIT=400000
+GAS_PRICE=0.00000006
+
+# Private key of the wallet executing trades
+PRIVATE_KEY=""
+
+# Alchemy / Infura API key for provider
+ALCHEMY_API_KEY="-"
+
+# RPC Provider
+LOCAL_RPC_URL=http://127.0.0.1:8545
+RPC_URL=https://eth-mainnet.g.alchemy.com/v2/ALCHEMY_API_KEY
 
 ### 4. Start Hardhat Node:
 In your terminal run:
@@ -335,4 +383,4 @@ Be sure to check their documentation for latest updates regarding their contract
 
 ### Additional Notes
 
-- If testing out the *manipulate.js* script, you'll also want to update the **UNLOCKED_ACCOUNT** variable and adjust **AMOUNT** as needed.
+- All tests should work, but some variables may need to be adjusted like threshold
