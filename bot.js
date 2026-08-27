@@ -1993,4 +1993,4 @@ async function executeTrade(ctx, params) {
 // ─────────────────────────────────────────
 main().catch(console.error);
 
-// !! Swapping over to a 1 Dex bot now!! Made changes to analzye, all working now with Quoter, changing CheckProfit now!!
+// !! Swapping over to a 1 Dex bot now!! Made changes to analzye, all working now with Quoter
